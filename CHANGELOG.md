@@ -20,11 +20,22 @@ Hindsight-inspired calibration loop. Three new cycle phases, eight expansions, o
 
 **Run `gbrain calibration --undo-wave v0.36.1.0`** to fully reverse the wave's mutations. Every new row carries `wave_version='v0.36.1.0'`; the undo command reverts auto-applied take resolutions, deletes calibration profiles, purges nudge logs, optionally scrubs gstack-coupled learnings. Dry-run mode shows what would change before you commit.
 
+### Validated by published benchmarks
+
+**First published benchmark for AI memory systems that reason about user track records.** Sibling repo [gbrain-evals](https://github.com/garrytan/gbrain-evals) ships two new categories specifically gating this wave:
+
+- **cat14 — advice quality A/B.** `think --with-calibration` vs baseline on 8 hand-authored probes covering 6 calibration scenarios (relevant bias, confidence boost, empty profile, irrelevant bias, multi-bias, voice stress). First live run: **75% calibrated wins / 0% baseline wins / 25% tie**, voice gate **100%**, force-fit prevention **100%**.
+- **cat15 — propose_takes F1.** Extract-takes prompt against 48 hand-labeled claims across 8 synthetic pages covering 5 prose genres. First live run: **0.952 F1 training / 0.922 F1 holdout**, train-holdout gap **0.03** (no overfitting). The tuned prompt back-ports verbatim into this wave's `EXTRACT_TAKES_PROMPT`, replacing the v1 stub.
+
+The iteration log at `eval/data/cat14-calibration/iteration-log.md` documents three same-day prompt variants where the gate caught two regressions before either could ship. Full benchmark report: [2026-05-18 BrainBench Cat 14 + Cat 15 Calibration](https://github.com/garrytan/gbrain-evals/blob/master/docs/benchmarks/2026-05-18-brainbench-cat14-cat15-calibration.md). No prior published baseline exists in the personal-AI calibration-loop space; Hindsight introduced the concept as a skills demo without quantified evaluation. cat14 + cat15 stake out the category.
+
+Reproduction: ~$0.15 per full eval run (cat14 + cat15), under 5 minutes wallclock on Apple Silicon.
+
 ### Itemized changes
 
 #### Three new cycle phases
 
-- **`propose_takes`** — LLM scans markdown prose, proposes gradeable claims to a review queue. Idempotency cache on `(source_id, page_slug, content_hash, prompt_version)` — unchanged pages never re-spend tokens. F2 fence-dedup: the LLM sees existing canonical takes and dedupes. v0.36.1.0 ships a stub prompt; tuned prompt arrives via the synthetic corpus build (T19) at `test/fixtures/calibration/extract-takes-corpus/`.
+- **`propose_takes`** — LLM scans markdown prose, proposes gradeable claims to a review queue. Idempotency cache on `(source_id, page_slug, content_hash, prompt_version)` — unchanged pages never re-spend tokens. F2 fence-dedup: the LLM sees existing canonical takes and dedupes. v0.36.1.0 ships the tuned `v0.36.1.0-tuned-cat15` prompt (replaces the v1 stub) — validated at **0.922 F1 holdout** by the cat15 eval against the hand-labeled corpus at `test/fixtures/calibration/`.
 - **`grade_takes`** — walks unresolved takes older than 6 months, retrieves evidence, asks a judge model. Auto-resolve DISABLED by default (D17 — earn trust first); operator opts in via `cycle.grade_takes.auto_resolve.enabled: true`. Conservative threshold: confidence >= 0.95 single-model OR >= 0.85 with 3/3 ensemble unanimous. Ensemble tiebreaker (E2) reuses v0.27.x cross-modal-eval substrate; fires on borderline single-model verdicts (0.6-0.95 band).
 - **`calibration_profile`** — aggregates resolved takes into 2-4 narrative pattern statements + active bias tags. Voice-gated via shared `gateVoice()` (D24 — five surfaces, one function). Cold-brain branch: skips when <5 resolved takes. `grade_completion` field surfaces partial-grade state to the dashboard "60% graded" badge.
 
