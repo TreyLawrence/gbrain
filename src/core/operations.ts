@@ -19,6 +19,7 @@ import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, parseTimeli
 import { isFactsBackstopEligible } from './facts/eligibility.ts';
 import { stripTakesFence } from './takes-fence.ts';
 import { stripFactsFence } from './facts-fence.ts';
+import { bumpLastRetrievedAt } from './last-retrieved.ts';
 import { CJK_SLUG_CHARS } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
@@ -480,6 +481,13 @@ const get_page: Operation = {
     if (!page) {
       throw new OperationError('page_not_found', `Page not found: ${slug}`, includeDeleted ? 'Check the slug or use fuzzy: true' : 'Page may be soft-deleted; pass include_deleted: true to verify');
     }
+
+    // v0.37.0 (D11): op-layer write-back for the `last_retrieved_at` stale
+    // signal. Fire-and-forget — caller does NOT await. Internal callers
+    // (sync, migrations, dream cycle) bypass this op handler so the signal
+    // stays clean. Throttled to ~1 write / 5 min per page via the SQL clause
+    // inside bumpLastRetrievedAt (D2).
+    bumpLastRetrievedAt(ctx.engine, [page.id]);
 
     const tags = await ctx.engine.getTags(page.slug, sourceOpts);
     // Privacy boundary for the per-token allow-list (v0.28.6 for takes,
@@ -1054,6 +1062,11 @@ const search: Operation = {
     const results = dedupResults(raw);
     const latency_ms = Date.now() - startedAt;
 
+    // v0.37.0 (D11): op-layer last_retrieved_at write-back. Fire-and-forget;
+    // results already returned by engine, this just marks them as user-surfaced
+    // for LSD's stale-page signal. 5-min throttle inside bumpLastRetrievedAt.
+    bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
+
     // Op-layer capture (v0.25.0). Fire-and-forget — no await on the
     // capture call so MCP response latency is unaffected. search has
     // no expand/detail/vector semantics so meta fields are fixed.
@@ -1237,6 +1250,10 @@ const query: Operation = {
       embeddingColumn: embeddingColumnParam,
     });
     const latency_ms = Date.now() - startedAt;
+
+    // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
+    // search handler — fire-and-forget, internal callers bypass this path.
+    bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
 
     // Op-layer capture (v0.25.0). Fire-and-forget. meta tells gbrain-evals
     // what hybridSearch *actually* did so replay can distinguish "with API

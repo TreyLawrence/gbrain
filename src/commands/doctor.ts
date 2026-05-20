@@ -572,6 +572,13 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // things when reranker is on vs off.
   checks.push(await checkRerankerHealth(engine));
 
+  // 9b. v0.37.0 brainstorm_health: surfaces three brainstorm/lsd readiness
+  // signals: (a) migration v77 applied (last_retrieved_at column exists),
+  // (b) calibration cold-start status (active_bias_tags empty), (c)
+  // search.track_retrieval enabled/disabled. Each surfaces a paste-ready
+  // fix hint.
+  checks.push(await checkBrainstormHealth(engine));
+
   // 10. v0.36.1.0 Hindsight calibration wave (T12) — four new checks:
   //   - abandoned_threads: high-conviction takes never revisited
   //   - calibration_freshness: profile is older than 7 days
@@ -832,6 +839,112 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       name: 'reranker_health',
       status: 'warn',
       message: `Could not check reranker audit: ${msg}`,
+    };
+  }
+}
+
+/**
+ * v0.37.0 brainstorm_health doctor check.
+ *
+ * Surfaces three readiness signals for `gbrain brainstorm` / `gbrain lsd`:
+ *
+ *   1. Migration v77 applied — the `pages.last_retrieved_at` column exists.
+ *      If missing, LSD's stale-page signal degrades silently (corpus-sampling
+ *      fallback only). Fix: `gbrain apply-migrations --yes`.
+ *
+ *   2. search.track_retrieval — when explicitly off, LSD never accumulates
+ *      stale signal (every page stays at NULL last_retrieved_at). Default-on
+ *      is fine; explicit-off is a warning so the user notices the setting.
+ *      Fix: `gbrain config set search.track_retrieval true`.
+ *
+ *   3. Calibration cold-start — the latest calibration profile has empty
+ *      `active_bias_tags`. brainstorm + LSD judge fall back to no-anti-bias
+ *      mode with a stderr warning at run time; this surfaces it earlier.
+ *      Fix: `gbrain calibration --regenerate` once enough takes are resolved.
+ *
+ * Returns the FIRST non-ok signal as the status — column-missing dominates,
+ * then disabled-tracking, then cold-start. All three are non-blocking warnings;
+ * brainstorm + LSD still work, just with degraded signal.
+ */
+export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check> {
+  // (1) Column probe — fast, single-query.
+  try {
+    const probeRows = await engine.executeRaw<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'pages' AND column_name = 'last_retrieved_at'
+       ) AS exists`,
+      []
+    );
+    const columnPresent = probeRows[0]?.exists === true;
+    if (!columnPresent) {
+      return {
+        name: 'brainstorm_health',
+        status: 'warn',
+        message: `pages.last_retrieved_at column missing. LSD stale-bias degraded to corpus-sampling. Fix: \`gbrain apply-migrations --yes\``,
+      };
+    }
+  } catch (e) {
+    // Information schema may not be queryable on every engine variant.
+    // Don't fail the doctor over this — degrade to skip.
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'brainstorm_health',
+      status: 'warn',
+      message: `Could not probe pages.last_retrieved_at (${msg}); brainstorm/lsd may run with degraded signal.`,
+    };
+  }
+
+  // (2) search.track_retrieval — explicit-off surfaces as a warning.
+  try {
+    const trackCfg = await engine.getConfig('search.track_retrieval');
+    if (trackCfg === 'false' || trackCfg === '0' || trackCfg === 'off' || trackCfg === 'no') {
+      return {
+        name: 'brainstorm_health',
+        status: 'warn',
+        message: `search.track_retrieval is explicitly off — LSD's stale-page signal never accumulates. Fix: \`gbrain config set search.track_retrieval true\` (or accept and use brainstorm only).`,
+      };
+    }
+  } catch {
+    // Config read miss is benign; default-on applies.
+  }
+
+  // (3) Calibration cold-start — empty active_bias_tags.
+  try {
+    const calibRows = await engine.executeRaw<{ active_bias_tags: string[] | null }>(
+      `SELECT active_bias_tags
+         FROM calibration_profiles
+         ORDER BY generated_at DESC
+         LIMIT 1`,
+      []
+    );
+    if (calibRows.length === 0) {
+      return {
+        name: 'brainstorm_health',
+        status: 'ok',
+        message: `Migration v77 applied; tracking enabled. Calibration profile not yet generated — brainstorm/lsd will run unbiased until enough takes are resolved.`,
+      };
+    }
+    const tags = calibRows[0].active_bias_tags;
+    if (!Array.isArray(tags) || tags.length === 0) {
+      return {
+        name: 'brainstorm_health',
+        status: 'ok',
+        message: `Migration v77 applied; tracking enabled. Calibration cold-start (no active_bias_tags) — judge runs unbiased. Fix when ready: \`gbrain calibration --regenerate\`.`,
+      };
+    }
+    return {
+      name: 'brainstorm_health',
+      status: 'ok',
+      message: `Migration v77 applied; tracking enabled; calibration profile with ${tags.length} bias tag(s) loaded.`,
+    };
+  } catch {
+    // Pre-v0.36.1 brain (no calibration_profiles table). Brainstorm/lsd still
+    // work without anti-bias context — orchestrator stderr-warns at run time.
+    return {
+      name: 'brainstorm_health',
+      status: 'ok',
+      message: `Migration v77 applied; tracking enabled. calibration_profiles table missing (pre-v0.36.1 brain) — judge runs unbiased.`,
     };
   }
 }
@@ -3209,6 +3322,9 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     // v0.35.0.0+ reranker_health — read JSONL audit; warn on auth or volume.
     progress.heartbeat('reranker_health');
     checks.push(await checkRerankerHealth(engine));
+    // v0.37.0 brainstorm_health — migration v77, track_retrieval, calibration cold-start.
+    progress.heartbeat('brainstorm_health');
+    checks.push(await checkBrainstormHealth(engine));
     // v0.36.0.0 (A5): ZE embedding key health + schema/config width consistency.
     progress.heartbeat('ze_embedding_health');
     checks.push(await checkZeEmbeddingHealth(engine));

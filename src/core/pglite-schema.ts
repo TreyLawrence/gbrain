@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS pages (
   effective_date_source TEXT,
   import_filename       TEXT,
   salience_touched_at   TIMESTAMPTZ,
+  -- v0.37.0 (migration v77): real stale-page signal for gbrain lsd
+  -- (mirrors src/schema.sql). NULL = never retrieved.
+  last_retrieved_at     TIMESTAMPTZ,
   CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
 
@@ -94,6 +97,10 @@ CREATE INDEX IF NOT EXISTS pages_deleted_at_purge_idx
 -- v0.29.1: expression index for since/until date-range filters.
 CREATE INDEX IF NOT EXISTS pages_coalesce_date_idx
   ON pages ((COALESCE(effective_date, updated_at)));
+-- v0.37.0: full B-tree index on last_retrieved_at supports LSD's stale-page
+-- query (mirrors src/schema.sql). Postgres handles NULL in B-tree indexes.
+CREATE INDEX IF NOT EXISTS pages_last_retrieved_at_idx
+  ON pages (last_retrieved_at);
 
 -- ============================================================
 -- content_chunks: chunked content with embeddings

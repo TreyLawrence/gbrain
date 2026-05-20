@@ -2,6 +2,94 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.37.0] - 2026-05-19
+
+**Your brain can now collide its own ideas.**
+
+You type `gbrain brainstorm "why are AI coding tools converging on the same UX?"` and get back five ideas. Each one cites two pages from your own notes: one that's close to the question, and one from a part of your brain that has no business being there. You see the slugs, you see how far the collision actually traveled (a 0-1 distance score next to each idea), and you can click through to read the source pages. Five minutes ago you didn't know your brain had those connections. The judge filters out anything trivial. Cost about 10 cents.
+
+Then you try `gbrain lsd` on the same question. Lateral Synaptic Drift. The dial is turned to 11: twelve pages from twelve different parts of your brain, the judge is inverted (rejects ideas that score too high on coherence — "too obvious, you'd have thought of this without LSD"), and the system explicitly prefers pages you haven't looked at in 90 days. Most of what comes back is noise. One of them is the thing your brain noticed in its sleep.
+
+This is bisociation, the Arthur Koestler thing. The Open Collider project demonstrated 4-13x distance shift over default prompting. Their version invents distant domains from training data. Ours uses what you already wrote down. That difference matters: every idea cites a real slug in your brain. You can audit it. You can trust it.
+
+**How to turn it on**
+
+```bash
+gbrain upgrade                                    # applies migration v77
+gbrain brainstorm "your question here"            # ~$0.10 per run
+gbrain lsd "your question here"                   # ~$0.30 per run
+gbrain doctor                                     # see brainstorm_health check
+```
+
+By default `brainstorm` saves to `wiki/ideas/<date>-brainstorm-<slug>.md` and `lsd` does not save (its output is ephemeral by design — pass `--save` if an idea lands). The dream cycle skips `mode: lsd` pages automatically so noise does not pollute the calibration profile.
+
+**The numbers that matter**
+
+| Mode | Close set | Far set | Ideas per cross | Judge threshold | Vibe |
+|---|---|---|---|---|---|
+| brainstorm | 4 | 6 | 3 | weighted 4.0/5 | Analyst riffing with their own notes. Defensible. |
+| lsd | 2 | 12 | 4 | inverted: rejects resistance >4.5 | Your brain at 3am noticing what it forgot. |
+
+**Things to watch**
+
+- The "far set" comes from prefix-stratified sampling. One page per top-level prefix (wiki/vc, wiki/biology, concepts/, etc), tiebroken by inbound link count. If your brain has only one or two top-level prefixes you will see a stderr warning that the bank was narrower than usual. Add more cross-domain content via `gbrain import` and the next run gets sharper.
+- LSD's stale-page bias works off a new column `pages.last_retrieved_at` bumped at the op-layer when search/query/get_page returns results. Default-on; if you do not want per-search writes to your pages table, `gbrain config set search.track_retrieval false` opts out (LSD then degrades to "no stale preference" but still works).
+- Calibration cold-start: if you have not generated a calibration profile yet (or your profile has no `active_bias_tags`), the judge runs without anti-bias context and stderr-warns. Brainstorm and LSD still work; the judge just is not penalizing your known biases.
+
+**What we caught and fixed before merging**
+
+Two architectural bugs caught by independent codex review that would have shipped silent:
+
+- The first plan said "diversify hybridSearch results to get far pages." That is broken. hybridSearch already filters to nearest neighbors before any rerank runs. Reranking that pool gets you "least similar among the similar," not actually distant brain regions. Replaced with a separate domain-bank module orthogonal to hybridSearch.
+- The first plan said "use `updated_at` as the stale-page proxy." Also broken. `putPage` bumps `updated_at` on every sync, so it measures sync churn, not forgottenness. Replaced with the new `last_retrieved_at` column bumped by search ops only.
+
+Plus a factual fix: the first plan claimed migration v68. v68 already exists. The shipped migration is v77.
+
+### Itemized changes
+
+**New commands** — `gbrain brainstorm <question>` and `gbrain lsd <question>` (CLI-only by design; LSD's MCP exposure deferred as a v0.38+ follow-up). `gbrain eval brainstorm <fixture.jsonl>` is the three-axis evaluation gate.
+
+**New module** — `src/core/brainstorm/{domain-bank,orchestrator,judges}.ts`. The orchestrator absorbs the output formatter + cost-preview + internal types (decorative-file fold per eng-review D1). Single `judges.ts` with shared `runJudge(config, ideas)` + two exported configs (`BRAINSTORM_JUDGE_CONFIG` + `LSD_JUDGE_CONFIG`) eliminates the ~70 LOC duplication between standard and inverted-rubric judges.
+
+**New engine surface** — `BrainEngine.listPrefixSampledPages(opts)` + `BrainEngine.listCorpusSample(opts)` with `sourceId?` + `sourceIds?` from day 1 (matches the canonical source-id-canonical-thread pattern; zero refactor cost when D7 MCP exposure ships in v0.38+). Parity on both Postgres and PGLite engines.
+
+**Schema migration v77** — `pages.last_retrieved_at TIMESTAMPTZ NULL` + full B-tree index on `pages (last_retrieved_at)`. Forward-reference bootstrap added on both engines for pre-v77 brain upgrades.
+
+**Op-layer write-back** — `src/core/last-retrieved.ts` exports `bumpLastRetrievedAt(engine, pageIds)`; called fire-and-forget from `search`/`query`/`get_page` op handlers after results return. Engine methods stay pure. Internal callers (sync, migrations, dream cycle) do not pollute the LSD signal. 5-minute throttle gating via the SQL `last_retrieved_at IS NULL OR last_retrieved_at < NOW() - INTERVAL '5 minutes'` clause skips ~90% of writes on heavily-searched brains.
+
+**Dream-cycle hook** — `src/core/cycle/transcript-discovery.ts` extends `isDreamOutput(content)` to also skip pages with `mode: lsd` frontmatter (noise-by-design). New exports `isLsdOutput()` and `isBrainstormOutput()` for future loop-closure work. `mode: brainstorm` pages are NOT auto-skipped (they are user-validated content); full corpus inclusion of saved brainstorm pages is filed as a v0.37.1 follow-up.
+
+**Doctor check** — `brainstorm_health` surfaces three signals: migration v77 applied, `search.track_retrieval` setting, calibration cold-start status. Paste-ready fix hints per signal.
+
+**Tests** — 38 new unit tests across `test/brainstorm/{distance,lsd-mode-skip,eval-brainstorm}.test.ts`. Pin: distance normalization (same-vector → 0, orthogonal → 0.5, opposite → 1, dimension mismatch throws), LSD frontmatter detection (with quoted-value tolerance), eval verdict logic (distance/usefulness/grounding conjunctive pass), fixture parsing.
+
+**Plan + reviews** — Open Collider analysis, CEO review (SELECTIVE EXPANSION mode, 6 proposals / 5 accepted), engineering review (8 decisions), two rounds of codex outside voice (25 total findings, all addressed). Plan persisted at `~/.claude/plans/system-instruction-you-are-working-staged-coral.md`.
+
+## To take advantage of v0.37.0
+
+`gbrain upgrade` should do this automatically. If it did not:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify migration v77 landed:**
+   ```bash
+   gbrain doctor --json | grep '"schema_version"'
+   ```
+   Should show: `"Version 77 (latest: 77)"`
+3. **Try it:**
+   ```bash
+   gbrain brainstorm "your question here"
+   gbrain lsd "your question here" --save
+   ```
+4. **Check brainstorm_health:**
+   ```bash
+   gbrain doctor --json | grep brainstorm_health
+   ```
+   Should show: `"Migration v77 applied; tracking enabled..."`
+5. **If anything fails,** file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor` and `~/.gbrain/upgrade-errors.jsonl` if present.
+
 ## [0.36.4.0] - 2026-05-18
 
 **Your agent can now drive your brain to 90/100 by itself, on a cron, without you watching.**
