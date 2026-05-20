@@ -1376,6 +1376,40 @@ If any answer is no, fix it before continuing.
 
 ## CHANGELOG voice + release-summary format
 
+**IRON RULE: the CHANGELOG describes what the user gets, not how the work
+happened.** Nobody reading release notes cares that codex caught a bug, that
+the plan went through CEO + eng review, that the migration was originally
+numbered v68 and renumbered to v79 during master merge, or that two
+review rounds caught architectural mistakes. The reader cares what
+`gbrain brainstorm` does and how to use it. If a fact only exists because
+of the development process, it does NOT belong in the CHANGELOG.
+
+**Specifically forbidden in CHANGELOG entries:**
+
+- Any mention of review processes (CEO review, eng review, codex review,
+  plan-eng-review, outside voice, adversarial review, autoplan, /review).
+- "What we caught and fixed before merging" sections. Bugs found pre-merge
+  are not changes — they're things that didn't ship.
+- Plan file references, plan IDs, plan decision tags (D1, D14, D-CDX-3).
+- Migration version drama ("originally v68", "renumbered to v77", "claimed
+  by parallel waves") — just say "Migration v79 adds X." If the user
+  cares about migration ordering, they read the diff.
+- Round counts, finding counts, decision counts ("25 findings across 2
+  rounds", "8 architectural decisions", "5/6 expansions accepted").
+- Names of internal collaborators ("codex caught", "the reviewer flagged",
+  "Claude noticed").
+- "Plan + reviews" summary bullets. The plan lives in `~/.claude/plans/`;
+  if a future reader wants the backstory they can grep there.
+- Any wording that frames a shipped feature as a *recovery* from a planning
+  mistake ("the first plan was wrong", "we corrected the approach", "the
+  shipped version supersedes the original design").
+
+**Smell test:** read the entry as a stranger who has never touched gbrain.
+If any sentence makes them think "why are you telling me this?", cut it.
+Every sentence in the release-summary AND in the itemized changes must
+answer one of three questions: *What can I now do? How do I use it? What
+should I watch for after I upgrade?*
+
 Every version entry in `CHANGELOG.md` MUST start with a release-summary section in
 the GStack/Garry voice — one viewport's worth of prose + tables that lands like a
 verdict, not marketing. The itemized changelog (subsections, bullets, files) goes

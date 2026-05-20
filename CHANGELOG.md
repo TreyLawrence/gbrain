@@ -32,38 +32,27 @@ By default `brainstorm` saves to `wiki/ideas/<date>-brainstorm-<slug>.md` and `l
 
 **Things to watch**
 
-- The "far set" comes from prefix-stratified sampling. One page per top-level prefix (wiki/vc, wiki/biology, concepts/, etc), tiebroken by inbound link count. If your brain has only one or two top-level prefixes you will see a stderr warning that the bank was narrower than usual. Add more cross-domain content via `gbrain import` and the next run gets sharper.
-- LSD's stale-page bias works off a new column `pages.last_retrieved_at` bumped at the op-layer when search/query/get_page returns results. Default-on; if you do not want per-search writes to your pages table, `gbrain config set search.track_retrieval false` opts out (LSD then degrades to "no stale preference" but still works).
-- Calibration cold-start: if you have not generated a calibration profile yet (or your profile has no `active_bias_tags`), the judge runs without anti-bias context and stderr-warns. Brainstorm and LSD still work; the judge just is not penalizing your known biases.
-
-**What we caught and fixed before merging**
-
-Two architectural bugs caught by independent codex review that would have shipped silent:
-
-- The first plan said "diversify hybridSearch results to get far pages." That is broken. hybridSearch already filters to nearest neighbors before any rerank runs. Reranking that pool gets you "least similar among the similar," not actually distant brain regions. Replaced with a separate domain-bank module orthogonal to hybridSearch.
-- The first plan said "use `updated_at` as the stale-page proxy." Also broken. `putPage` bumps `updated_at` on every sync, so it measures sync churn, not forgottenness. Replaced with the new `last_retrieved_at` column bumped by search ops only.
-
-Plus a factual fix: the first plan claimed migration v68. v68 already taken; v77 + v78 then claimed by parallel waves; the shipped migration is v79.
+- The "far set" comes from prefix-stratified sampling. One page per top-level prefix (`wiki/vc`, `wiki/biology`, `concepts/`, etc), tiebroken by inbound link count. If your brain has only one or two top-level prefixes you will see a stderr warning that the bank was narrower than usual. Add more cross-domain content via `gbrain import` and the next run gets sharper.
+- LSD's stale-page bias works off a new column `pages.last_retrieved_at` bumped when `search`/`query`/`get_page` returns results. Default-on. If you do not want per-search writes, `gbrain config set search.track_retrieval false` opts out (LSD then runs without the stale-preference signal but still works). Internal callers (sync, migrations, dream cycle) never bump the column — the signal stays clean.
+- Calibration cold-start: if your `calibration_profiles` row has no `active_bias_tags`, the judge runs without anti-bias context and stderr-warns. Both commands still work; the judge just is not penalizing your known biases.
 
 ### Itemized changes
 
-**New commands** — `gbrain brainstorm <question>` and `gbrain lsd <question>` (CLI-only by design; LSD's MCP exposure deferred as a v0.38+ follow-up). `gbrain eval brainstorm <fixture.jsonl>` is the three-axis evaluation gate.
+**New commands** — `gbrain brainstorm <question>` and `gbrain lsd <question>`, both CLI-only. `gbrain eval brainstorm <fixture.jsonl>` is the three-axis evaluation gate (distance + usefulness + grounding, all three must clear).
 
-**New module** — `src/core/brainstorm/{domain-bank,orchestrator,judges}.ts`. The orchestrator absorbs the output formatter + cost-preview + internal types (decorative-file fold per eng-review D1). Single `judges.ts` with shared `runJudge(config, ideas)` + two exported configs (`BRAINSTORM_JUDGE_CONFIG` + `LSD_JUDGE_CONFIG`) eliminates the ~70 LOC duplication between standard and inverted-rubric judges.
+**New module** — `src/core/brainstorm/{domain-bank,orchestrator,judges}.ts`. One `judges.ts` exports a shared `runJudge(config, ideas)` plus `BRAINSTORM_JUDGE_CONFIG` + `LSD_JUDGE_CONFIG`, so the two modes share judge plumbing.
 
-**New engine surface** — `BrainEngine.listPrefixSampledPages(opts)` + `BrainEngine.listCorpusSample(opts)` with `sourceId?` + `sourceIds?` from day 1 (matches the canonical source-id-canonical-thread pattern; zero refactor cost when D7 MCP exposure ships in v0.38+). Parity on both Postgres and PGLite engines.
+**New engine surface** — `BrainEngine.listPrefixSampledPages(opts)` + `BrainEngine.listCorpusSample(opts)`, parity on both Postgres and PGLite. Both accept `sourceId?` and `sourceIds?` for federated-read scoping.
 
-**Schema migration v79** — `pages.last_retrieved_at TIMESTAMPTZ NULL` + full B-tree index on `pages (last_retrieved_at)`. Forward-reference bootstrap added on both engines for pre-v79 brain upgrades.
+**Schema migration v79** — `pages.last_retrieved_at TIMESTAMPTZ NULL` + full B-tree index on `pages (last_retrieved_at)`. Forward-reference bootstrap added on both engines so pre-v79 brains upgrade cleanly.
 
-**Op-layer write-back** — `src/core/last-retrieved.ts` exports `bumpLastRetrievedAt(engine, pageIds)`; called fire-and-forget from `search`/`query`/`get_page` op handlers after results return. Engine methods stay pure. Internal callers (sync, migrations, dream cycle) do not pollute the LSD signal. 5-minute throttle gating via the SQL `last_retrieved_at IS NULL OR last_retrieved_at < NOW() - INTERVAL '5 minutes'` clause skips ~90% of writes on heavily-searched brains.
+**Op-layer write-back** — `src/core/last-retrieved.ts` exports `bumpLastRetrievedAt(engine, pageIds)`. Called fire-and-forget from the `search`/`query`/`get_page` op handlers after results return. 5-minute throttle via the SQL `WHERE last_retrieved_at IS NULL OR last_retrieved_at < NOW() - INTERVAL '5 minutes'` clause skips ~90% of writes on heavily-searched brains.
 
-**Dream-cycle hook** — `src/core/cycle/transcript-discovery.ts` extends `isDreamOutput(content)` to also skip pages with `mode: lsd` frontmatter (noise-by-design). New exports `isLsdOutput()` and `isBrainstormOutput()` for future loop-closure work. `mode: brainstorm` pages are NOT auto-skipped (they are user-validated content); full corpus inclusion of saved brainstorm pages is filed as a v0.37.1 follow-up.
+**Dream-cycle skip** — `src/core/cycle/transcript-discovery.ts` extends `isDreamOutput(content)` to also skip pages with `mode: lsd` frontmatter (noise-by-design). New exports `isLsdOutput()` and `isBrainstormOutput()` for downstream callers.
 
 **Doctor check** — `brainstorm_health` surfaces three signals: migration v79 applied, `search.track_retrieval` setting, calibration cold-start status. Paste-ready fix hints per signal.
 
-**Tests** — 38 new unit tests across `test/brainstorm/{distance,lsd-mode-skip,eval-brainstorm}.test.ts`. Pin: distance normalization (same-vector → 0, orthogonal → 0.5, opposite → 1, dimension mismatch throws), LSD frontmatter detection (with quoted-value tolerance), eval verdict logic (distance/usefulness/grounding conjunctive pass), fixture parsing.
-
-**Plan + reviews** — Open Collider analysis, CEO review (SELECTIVE EXPANSION mode, 6 proposals / 5 accepted), engineering review (8 decisions), two rounds of codex outside voice (25 total findings, all addressed). Plan persisted at `~/.claude/plans/system-instruction-you-are-working-staged-coral.md`.
+**Tests** — 38 new unit tests across `test/brainstorm/{distance,lsd-mode-skip,eval-brainstorm}.test.ts`. Pin distance normalization (same-vector → 0, orthogonal → 0.5, opposite → 1, dimension mismatch throws), LSD frontmatter detection, eval verdict logic, fixture parsing.
 
 ## To take advantage of v0.37.1.0
 
