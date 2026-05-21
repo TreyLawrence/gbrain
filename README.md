@@ -63,6 +63,38 @@ gbrain serve --http       # HTTP MCP with OAuth 2.1 + admin dashboard
 
 Per-client guides (Claude Desktop, Code, Cursor, ChatGPT, Perplexity, Cowork) live under [`docs/mcp/`](docs/mcp/). HTTP server supports DCR-style client registration, scope-gated access (`read`/`write`/`admin`), and built-in rate limiting.
 
+## How to get data in (v0.38+)
+
+One command, local or hosted, synchronous receipt:
+
+```bash
+gbrain capture "the thought I want to remember"
+gbrain capture --file ./notes/today.md
+echo "from a pipe" | gbrain capture --stdin
+SLUG=$(gbrain capture "..." --quiet)
+```
+
+The page lands in the DB AND on disk in one move (the v0.38 `put_page`
+write-through plumbing). Default slug `inbox/YYYY-MM-DD-<hash8>` so
+captures cluster in a predictable triage location. On thin-client installs
+the verb routes through MCP to the server — same command, same UX.
+
+For webhook ingestion (Zapier / IFTTT / Apple Shortcuts):
+
+```bash
+curl -X POST https://your-brain/ingest \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: text/markdown" \
+  -d "# a thought from a Shortcut"
+```
+
+For mobile capture, the inbox folder source picks up anything dropped into
+`~/.gbrain/inbox/` from iOS Shortcuts / AirDrop / Drafts / Finder.
+
+Third-party skillpacks can ship custom ingestion sources (Granola, Linear,
+voice, OCR) against the versioned `IngestionSource` contract at
+`gbrain/ingestion`. See [`docs/skillpack-anatomy.md`](docs/skillpack-anatomy.md).
+
 ## What it does (the loop)
 
 ```

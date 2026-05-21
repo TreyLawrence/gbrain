@@ -2,6 +2,173 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.38.0.0] - 2026-05-21
+
+**One command to capture anything into your brain. Local OR hosted, doesn't matter.**
+
+You type `gbrain capture "the thought I want to remember"` and the right
+thing happens. The page lands in your brain — both as a queryable row AND
+as a markdown file on disk, in one move. You see the slug come back as a
+five-line receipt. You can search for it 200ms later. If you piped from
+stdin or pointed at a file, same deal. If you're on a hosted brain
+(thin-client install), it routes through MCP to the server transparently
+— same command, same UX.
+
+Pre-v0.38 the answer to "how do I get a thought into the brain?" was
+three different answers depending on context: `put_page` over MCP (DB
+only, file drifts), commit a file then run sync (works but commit-then-
+sync is friction), or autopilot wait (poll every 5min, latency-bound).
+v0.38 collapses these into one mental model: **the brain is a markdown
+file tree wherever the DB lives, and `gbrain capture` is the front door.**
+
+### How to use it
+
+```
+gbrain capture "remember to follow up on X"
+gbrain capture --file ./notes/today.md
+echo "from a pipe" | gbrain capture --stdin
+SLUG=$(gbrain capture "..." --quiet)   # script-friendly
+gbrain capture "..." --json            # for agents
+```
+
+### The plumbing
+
+| Surface | What it does |
+|---|---|
+| `gbrain capture` | Single human-facing entrypoint. Local installs route through `put_page` directly; thin-client installs route through `callRemoteTool('put_page', ...)`. Same UX both ways. |
+| `put_page` write-through | After a page lands in the DB, the markdown file is written to disk too. Closes the drift class the v0.35.6.0 phantom-redirect pass was cleaning up. Subagent sandbox + dry-run writes stay DB-only. |
+| `POST /ingest` on `serve --http` | OAuth-gated webhook so Zapier / IFTTT / Apple Shortcuts can drop into your brain. Tagged `untrusted_payload: true`; rate-limited; 1MB cap; content-type allowlist. |
+| `IngestionSource` contract | Versioned public API at `gbrain/ingestion` and `gbrain/ingestion/test-harness` package subpaths. Third-party skillpack publishers can build sources (Granola, Linear, voice, OCR) against the contract. |
+| Ingestion daemon | Supervises file-watcher + inbox-folder + future built-in sources. Per-source crash-counter + exponential backoff (the v0.34.3.0 ChildWorkerSupervisor pattern adapted for in-process modules). 24h content-hash dedup window. Per-source rate limit. |
+| file-watcher source | chokidar-based watcher over your brain repo. 1s debounce coalesces editor save-storms. Honors `pruneDir` (single source of truth with sync). Linux ENOSPC surfaces a paste-ready sysctl hint. |
+| inbox-folder source | Drop a file into `~/.gbrain/inbox/` from iOS Shortcuts / AirDrop / Drafts / Finder. Daemon picks it up, ingests, auto-archives to `.archived/YYYY-MM-DD/`. |
+| `IngestionTestHarness` | Publisher-facing test utility with fake clock + in-memory event bus + `expectEvent` matchers. Exported as a versioned public API so skillpack authors can write unit tests without spinning up a daemon. |
+
+### Provenance
+
+Every page captured via the v0.38 paths now carries provenance frontmatter:
+
+```yaml
+ingested_via: put_page              # local CLI
+ingested_via: 'mcp:put_page'        # MCP remote
+ingested_via: capture-cli           # via `gbrain capture`
+ingested_via: webhook               # via POST /ingest
+ingested_at: 2026-05-21T04:15:00Z
+```
+
+Migration v80 adds the four nullable columns (`ingested_via`,
+`ingested_at`, `source_uri`, `source_kind`). Historical pages stay
+NULL — pre-v0.38 pages never had provenance and the columns are
+additive.
+
+### IngestionSource contract for skillpack authors
+
+```ts
+import { IngestionSource, IngestionEvent } from 'gbrain/ingestion';
+import { IngestionTestHarness, expectEvent } from 'gbrain/ingestion/test-harness';
+
+export default function createSource(config: Record<string, unknown>): IngestionSource {
+  return {
+    id: 'voice-granola',
+    kind: 'voice-whisper',
+    async start(ctx) {
+      // Poll Granola, emit events:
+      ctx.emit({
+        source_id: 'voice-granola',
+        source_kind: 'voice-whisper',
+        source_uri: 'granola://transcript/123',
+        received_at: new Date().toISOString(),
+        content_type: 'text/markdown',
+        content: transcript,
+        content_hash: computeContentHash(transcript),
+      });
+    },
+    async stop() { /* drain */ },
+  };
+}
+```
+
+Declared in `gbrain.plugin.json` with `api_version: 'gbrain-ingestion-source-v1'`. Mismatched API versions fail loudly with a paste-ready upgrade hint, never silently break. Both subpaths are pinned by `test/public-exports.test.ts` so breaking the contract is a major-version change.
+
+### What this commit ships
+
+- v0.38 ingestion substrate: ~1500 LOC + ~150 LOC tests across 6 modules (types, dedup, daemon, skillpack-load, test-harness, two built-in sources)
+- POST /ingest webhook source on `serve --http`
+- `ingest_capture` Minion handler
+- `put_page` write-through (server-side, source-aware filing layout)
+- `serializePageToMarkdown` + `resolvePageFilePath` DRY extract (synthesize.ts dream-cycle render is now a 4-line wrapper)
+- Migration v80 — provenance columns on `pages`
+- `gbrain capture` CLI verb
+- 271+ new test cases across ingestion + commands + public-exports
+
+### Itemized changes
+
+- `src/core/ingestion/types.ts` (NEW) — IngestionSource + IngestionEvent + IngestionSourceContext + validateIngestionEvent + computeContentHash + IngestionEventError + INGESTION_SOURCE_API_VERSION + INGESTION_CONTENT_TYPES
+- `src/core/ingestion/dedup.ts` (NEW) — 24h content-hash LRU with 5000-entry cap
+- `src/core/ingestion/skillpack-load.ts` (NEW) — `gbrain.plugin.json` discovery with api_version compat + collision policy + in-process trust model for v1
+- `src/core/ingestion/test-harness.ts` (NEW) — publisher-facing test utility exported as `gbrain/ingestion/test-harness`
+- `src/core/ingestion/daemon.ts` (NEW) — IngestionDaemon: SourceSupervisor pattern + validate → dedup → rate-limit → dispatch pipeline + health surface
+- `src/core/ingestion/sources/file-watcher.ts` (NEW) — chokidar source with 1s debounce, atomic-write handling, ENOSPC sysctl-hint surfacing
+- `src/core/ingestion/sources/inbox-folder.ts` (NEW) — Shortcuts/AirDrop target with auto-archive to `.archived/YYYY-MM-DD/`
+- `src/core/ingestion/index.ts` (NEW) — barrel for `gbrain/ingestion`
+- `src/core/minions/handlers/ingest-capture.ts` (NEW) — `ingest_capture` Minion handler with slug-resolution fallback chain
+- `src/commands/serve-http.ts` — POST /ingest webhook route with OAuth write scope + rate limit + content-type allowlist + 1MB payload cap + `untrusted_payload: true` tagging
+- `src/commands/jobs.ts` — registers `ingest_capture` in `registerBuiltinHandlers`
+- `src/core/operations.ts` — put_page write-through after `importFromContent` with trust gating (subagent sandbox / dry-run stay DB-only) + provenance frontmatter stamp
+- `src/core/markdown.ts` — `serializePageToMarkdown(page, tags, opts)` + `resolvePageFilePath(brainDir, slug, sourceId)` DRY extract
+- `src/core/cycle/synthesize.ts` — `renderPageToMarkdown` becomes a 4-line wrapper around `serializePageToMarkdown`
+- `src/core/migrate.ts` — migration v80 `pages_provenance_columns` adds 4 nullable columns
+- `src/commands/capture.ts` (NEW) — `gbrain capture` CLI verb with local + thin-client routing, --file / --stdin / --slug / --type / --source / --quiet / --json
+- `src/cli.ts` — registers `capture` dispatch case + `CLI_ONLY` entry
+- `package.json` — adds `chokidar` dep + `gbrain/ingestion` + `gbrain/ingestion/test-harness` exports
+- `test/public-exports.test.ts` + `scripts/check-exports-count.sh` — pin new public subpaths (count 18 → 20)
+
+### Deferred to follow-up releases
+
+These were in the v0.38 plan but did not land in this release:
+
+- Daemon rename `gbrain autopilot` → `gbrain ingest` with forever-alias + launchd plist migration
+- cron-scheduler skill refactor + OpenClaw credential auto-migrate (the existing skill still works untouched; the migration into a daemon-side source ships in a follow-up)
+- Content-type processors (PDF text extract, image OCR, audio transcribe, video keyframe). The webhook source currently rejects binary content_types with HTTP 415 and a paste-ready hint; processors land as skillpack-distributed sources.
+- `gbrain doctor` inotify-limit probe (Linux) — chokidar still surfaces ENOSPC at runtime with the sysctl hint; the doctor-time static probe is a polish item.
+- Publisher DX cathedral: `gbrain skillpack init --kind=ingestion-source <name>` scaffold extension, `gbrain ingest test [--watch]`, `gbrain ingest tail <source-id>`, `gbrain ingest validate <path>`. The IngestionTestHarness export is the foundation publishers can use today; the CLI helpers come next.
+- Skillpack reference pack at `examples/skillpack-ingestion-reference/` and the 3-stage tutorial in `docs/ingestion-source-skillpack.md`.
+
+These do not block the v0.38 release: the substrate is shipped and queryable; sources can be built against the contract today using the IngestionTestHarness; the cathedral commits add polish around the publisher experience.
+
+## To take advantage of v0.38.0.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Try the capture verb:**
+   ```bash
+   gbrain capture "first thought into v0.38"
+   gbrain query "first thought"
+   ```
+   The receipt block should show the slug + file path; the query should
+   return the page within a second.
+3. **For webhook ingestion** (only if you run `gbrain serve --http`):
+   ```bash
+   curl -X POST https://your-brain/ingest \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: text/markdown" \
+     -d "# webhook test"
+   ```
+   You should see HTTP 202 + a `job_id`. Run `gbrain query "webhook test"`
+   to confirm the page landed.
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
+
 ## [0.37.1.0] - 2026-05-19
 
 **Your brain can now collide its own ideas.**
