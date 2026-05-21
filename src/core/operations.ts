@@ -10,6 +10,9 @@ import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
+import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
+import { mkdirSync, writeFileSync, existsSync, statSync } from 'fs';
+import { dirname } from 'path';
 import { hybridSearch, hybridSearchCached } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
@@ -590,6 +593,76 @@ const put_page: Operation = {
       ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
     });
 
+    // v0.38 put_page write-through:
+    // After importFromContent succeeds, if `sync.repo_path` resolves to a
+    // real directory, persist the markdown file to disk alongside the DB
+    // row. Closes the drift class where DB and file diverged after every
+    // put_page call (the v0.35.6.0 phantom-redirect pass exists because
+    // of this drift). Failures are non-fatal — log but don't roll back
+    // the DB write, which is the durable record. Subsequent sync runs
+    // reconcile if needed.
+    //
+    // Trust gating:
+    //   - Subagent sandbox (viaSubagent without allowedSlugPrefixes) → DB-only.
+    //     Sandbox writes live in wiki/agents/<id>/ and don't earn a file slot.
+    //   - All other writes (local CLI, MCP write-scope agents, trusted
+    //     workspace subagents) → write-through.
+    //
+    // The trusted-workspace path (synthesize/patterns) also runs its own
+    // reverseWriteRefs in synthesize.ts:reverseWriteRefs as part of the
+    // cycle phase. Both paths writing the same file is idempotent — the
+    // second writeFileSync overwrites with byte-identical content.
+    let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
+    const isSandboxSubagent = ctx.viaSubagent === true
+      && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
+    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
+      try {
+        const repoPath = await ctx.engine.getConfig('sync.repo_path');
+        if (!repoPath) {
+          writeThrough = { written: false, skipped: 'no_repo_configured' };
+        } else if (!existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
+          writeThrough = { written: false, skipped: 'repo_not_found' };
+        } else {
+          // Pull the freshly-written page + tags from the engine so the
+          // markdown we serialize reflects the post-import state, not the
+          // pre-import parsedPage view (which lacks DB-derived fields like
+          // updated_at metadata).
+          const sourceId = ctx.sourceId ?? 'default';
+          const writtenPage = await ctx.engine.getPage(result.slug, { sourceId });
+          if (writtenPage) {
+            const tags = await ctx.engine.getTags(result.slug, { sourceId });
+            // Provenance stamp on the frontmatter so future sync round-trips
+            // know where this page came from. Local CLI writes get
+            // ingested_via='put_page'; MCP writes get 'mcp:put_page'.
+            const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
+            const md = serializePageToMarkdown(writtenPage, tags, {
+              frontmatterOverrides: {
+                ingested_via: provenanceVia,
+                ingested_at: new Date().toISOString(),
+                source_kind: provenanceVia,
+              },
+            });
+            const filePath = resolvePageFilePath(repoPath as string, result.slug, sourceId);
+            mkdirSync(dirname(filePath), { recursive: true });
+            writeFileSync(filePath, md, 'utf8');
+            writeThrough = { written: true, path: filePath };
+          } else {
+            writeThrough = { written: false, skipped: 'page_not_found_after_write' };
+          }
+        }
+      } catch (e) {
+        // Loud log; DB write NOT rolled back. The phantom-redirect pass
+        // catches lingering drift.
+        const msg = e instanceof Error ? e.message : String(e);
+        ctx.logger.warn(`[put_page] write-through failed for ${result.slug}: ${msg}`);
+        writeThrough = { written: false, error: msg };
+      }
+    } else if (isSandboxSubagent) {
+      writeThrough = { written: false, skipped: 'subagent_sandbox' };
+    } else if (ctx.dryRun) {
+      writeThrough = { written: false, skipped: 'dry_run' };
+    }
+
     // Auto-link post-hook: runs AFTER importFromContent (which is its own
     // transaction). Runs even on status='skipped' so reconciliation catches drift
     // between the page text and the links table. Failures are non-blocking.
@@ -729,6 +802,7 @@ const put_page: Operation = {
       ...(autoTimeline ? { auto_timeline: autoTimeline } : {}),
       ...(writerLint ? { writer_lint: writerLint } : {}),
       ...(factsQueued ? { facts_backstop: factsQueued } : {}),
+      ...(writeThrough ? { write_through: writeThrough } : {}),
     };
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },

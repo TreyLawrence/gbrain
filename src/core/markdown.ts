@@ -1,5 +1,5 @@
 import matter from 'gray-matter';
-import type { PageType } from './types.ts';
+import type { Page, PageType } from './types.ts';
 import { slugifyPath } from './sync.ts';
 
 export type ParseValidationCode =
@@ -394,4 +394,84 @@ function extractTags(frontmatter: Record<string, unknown>): string[] {
   if (Array.isArray(tags)) return tags.map(String);
   if (typeof tags === 'string') return tags.split(',').map(t => t.trim()).filter(Boolean);
   return [];
+}
+
+// ---------------------------------------------------------------------------
+// Page -> markdown serialization helpers (v0.38 DRY extract per eng review)
+//
+// Pre-v0.38 the dream cycle's reverse-render at src/core/cycle/synthesize.ts
+// and the planned v0.38 put_page write-through path were going to have
+// near-identical 15-line bodies that differed only in their frontmatter
+// stamps. This extract is the single source of truth.
+// ---------------------------------------------------------------------------
+
+import { join } from 'node:path';
+
+/** Options for serializePageToMarkdown. */
+export interface SerializePageOpts {
+  /** Frontmatter fields merged on top of page.frontmatter at render time.
+   *  Use this to stamp provenance (`ingested_via: 'webhook'`), identity
+   *  markers (`dream_generated: true`), or any caller-specific extra
+   *  fields. Original page.frontmatter keys win unless explicitly
+   *  overridden. */
+  frontmatterOverrides?: Record<string, unknown>;
+}
+
+/**
+ * Render a Page row to its canonical on-disk markdown form. Sibling to
+ * `serializeMarkdown` (which takes the underlying primitives); this version
+ * pulls everything from a `Page` object so callers don't have to destructure
+ * compiled_truth / timeline / tags / frontmatter at every site.
+ *
+ * - Frontmatter: starts from `page.frontmatter`, merged with optional
+ *   `opts.frontmatterOverrides`. Useful for stamping `dream_generated`,
+ *   `ingested_via`, etc.
+ * - Type / title: pulled from the Page columns; falls back to 'note' /
+ *   empty string when absent.
+ * - Tags: passed separately so callers don't need to query engine.getTags
+ *   if they already have them in hand.
+ */
+export function serializePageToMarkdown(
+  page: Page,
+  tags: string[],
+  opts: SerializePageOpts = {},
+): string {
+  const frontmatter: Record<string, unknown> = {
+    ...((page.frontmatter ?? {}) as Record<string, unknown>),
+    ...(opts.frontmatterOverrides ?? {}),
+  };
+  return serializeMarkdown(
+    frontmatter,
+    page.compiled_truth ?? '',
+    page.timeline ?? '',
+    {
+      type: (page.type as PageType) ?? 'note',
+      title: page.title ?? '',
+      tags,
+    },
+  );
+}
+
+/**
+ * Compute the on-disk path for a (brainDir, slug, source_id) tuple per
+ * the v0.32.8 multi-source filing layout:
+ *   - Default source: `<brainDir>/<slug>.md`
+ *   - Non-default source: `<brainDir>/.sources/<source_id>/<slug>.md`
+ *
+ * Shared by the dream-cycle reverse-render (`reverseWriteRefs` in
+ * synthesize.ts) and the v0.38 put_page write-through path so both
+ * sites compute the same path for the same row.
+ *
+ * NOTE: caller is responsible for validating `source_id` against path-
+ * traversal attacks via `validateSourceId` (src/core/utils.ts) BEFORE
+ * passing it here. This helper does the filename math only.
+ */
+export function resolvePageFilePath(
+  brainDir: string,
+  slug: string,
+  sourceId: string,
+): string {
+  return sourceId === 'default'
+    ? join(brainDir, `${slug}.md`)
+    : join(brainDir, '.sources', sourceId, `${slug}.md`);
 }
