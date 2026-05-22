@@ -2249,6 +2249,170 @@ const submit_job: Operation = {
   },
 };
 
+// v0.38 Slice 3 — D13 — remote-callable submit_agent with registration-time
+// binding enforcement. Distinct from `submit_job` because:
+//   1. It's the FIRST op that lets remote MCP callers spawn paid LLM work
+//      (cost concerns + audit trail differ from generic submit_job).
+//   2. The trust boundary lives in oauth_clients.bound_* fields, not in the
+//      protected-name guard. Bindings are enforced PER-OP, not per-name.
+//   3. The dispatcher is the subagent handler with the gateway-native loop
+//      (agent.use_gateway_loop is auto-on for submit_agent jobs).
+const submit_agent: Operation = {
+  name: 'submit_agent',
+  description: 'Submit an LLM agent job that the worker dispatches via the gateway-native tool loop. Requires the `agent` OAuth scope. Tools, source, slug prefixes, max concurrency, and daily budget are bound at OAuth client registration time.',
+  params: {
+    prompt: { type: 'string', required: true, description: 'User prompt for the agent' },
+    model: { type: 'string', description: 'provider:model string (defaults to models.tier.subagent)' },
+    allowed_tools: { type: 'array', description: 'Subset of bound_tools the agent may invoke', items: { type: 'string' } },
+    allowed_slug_prefixes: { type: 'array', description: 'Subset of bound_slug_prefixes for put_page writes', items: { type: 'string' } },
+    max_turns: { type: 'number', description: 'Max LLM turns (default 20, hard cap 100)' },
+    queue: { type: 'string', description: 'Queue name (default "default")' },
+  },
+  mutating: true,
+  scope: 'agent' as any,
+  handler: async (ctx, p) => {
+    // Remote-callable but only when the OAuth client has scope=agent AND
+    // a binding row. Local CLI callers (ctx.remote === false) skip the
+    // binding check — `gbrain agent run` already runs through subagent.ts
+    // directly without going through this op.
+    if (ctx.remote === false) {
+      throw new OperationError('invalid_request', 'submit_agent over the local CLI: use `gbrain agent run` instead.');
+    }
+
+    const clientId = (ctx as { auth?: { clientId?: string } }).auth?.clientId;
+    if (!clientId || typeof clientId !== 'string') {
+      throw new OperationError('permission_denied', 'submit_agent requires an OAuth client with the `agent` scope.');
+    }
+
+    // Load the binding row.
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const sql = sqlQueryForEngine(ctx.engine);
+    let bindingRows: Array<Record<string, unknown>>;
+    try {
+      bindingRows = await sql`
+        SELECT bound_tools, bound_source_id, bound_brain_id, bound_slug_prefixes,
+               bound_max_concurrent, budget_usd_per_day::text AS budget_cap
+          FROM oauth_clients
+         WHERE client_id = ${clientId}
+      `;
+    } catch (err) {
+      throw new OperationError(
+        'internal',
+        `submit_agent: could not load OAuth client binding: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (bindingRows.length === 0) {
+      throw new OperationError('permission_denied', `submit_agent: client_id ${clientId} not found.`);
+    }
+    const binding = bindingRows[0];
+    const boundTools = (binding.bound_tools as string[] | null) ?? null;
+    const boundSource = (binding.bound_source_id as string | null) ?? null;
+    const boundSlugPrefixes = (binding.bound_slug_prefixes as string[] | null) ?? null;
+    const boundMaxConcurrent = Number(binding.bound_max_concurrent ?? 1);
+    const budgetCapText = (binding.budget_cap as string | null) ?? null;
+
+    if (boundTools === null) {
+      throw new OperationError(
+        'permission_denied',
+        `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`,
+      );
+    }
+
+    // Validate each param against the binding.
+    const requestedTools = (p.allowed_tools as string[] | undefined) ?? boundTools;
+    for (const t of requestedTools) {
+      if (!boundTools.includes(t)) {
+        throw new OperationError(
+          'permission_denied',
+          `submit_agent: tool "${t}" is not in client ${clientId}'s bound_tools (${boundTools.join(', ')}).`,
+        );
+      }
+    }
+    const requestedSlugPrefixes = (p.allowed_slug_prefixes as string[] | undefined) ?? boundSlugPrefixes ?? [];
+    if (boundSlugPrefixes !== null) {
+      for (const sp of requestedSlugPrefixes) {
+        if (!boundSlugPrefixes.some(bp => sp.startsWith(bp) || bp === sp)) {
+          throw new OperationError(
+            'permission_denied',
+            `submit_agent: slug_prefix "${sp}" is not under any of client ${clientId}'s bound_slug_prefixes.`,
+          );
+        }
+      }
+    }
+
+    // Concurrency cap: count active+waiting agent jobs for this client.
+    const inflight = await sql`
+      SELECT COUNT(*)::int AS n
+        FROM minion_jobs j
+       WHERE j.name = 'subagent'
+         AND j.status IN ('waiting', 'active', 'waiting-children')
+         AND j.data->>'__owner_client_id' = ${clientId}
+    `;
+    const inflightCount = Number((inflight[0]?.n as number | string | undefined) ?? 0);
+    if (inflightCount >= boundMaxConcurrent) {
+      throw new OperationError(
+        'rate_limited',
+        `submit_agent: client ${clientId} at concurrency cap (${inflightCount}/${boundMaxConcurrent}).`,
+      );
+    }
+
+    // Dry-run echo.
+    if (ctx.dryRun) {
+      return {
+        dry_run: true,
+        action: 'submit_agent',
+        client_id: clientId,
+        bound_tools: boundTools,
+        bound_source: boundSource,
+        bound_max_concurrent: boundMaxConcurrent,
+      };
+    }
+
+    // Submit via MinionQueue with allowProtectedSubmit (the agent op is
+    // remote-callable but the underlying job name 'subagent' is protected;
+    // the OAuth scope check above stands in for the protected-name guard).
+    const { MinionQueue } = await import('./minions/queue.ts');
+    const queue = new MinionQueue(ctx.engine);
+
+    const jobData: Record<string, unknown> = {
+      prompt: p.prompt as string,
+      max_turns: Math.min((p.max_turns as number) ?? 20, 100),
+      allowed_tools: requestedTools,
+      allowed_slug_prefixes: requestedSlugPrefixes,
+      __owner_client_id: clientId,
+    };
+    if (typeof p.model === 'string') jobData.model = p.model;
+    if (boundSource) jobData.source_id = boundSource;
+    const job = await queue.add(
+      'subagent',
+      jobData,
+      { queue: (p.queue as string) || 'default' },
+      { allowProtectedSubmit: true },
+    );
+
+    // Audit trail (D4) — best-effort JSONL.
+    try {
+      const { logAgentSubmission } = await import('./minions/agent-audit.ts');
+      const budgetCapCents = budgetCapText ? Math.round(parseFloat(budgetCapText) * 100) : null;
+      const promptText = typeof p.prompt === 'string' ? p.prompt : '';
+      logAgentSubmission({
+        client_id: clientId,
+        job_id: job.id,
+        model: typeof p.model === 'string' ? p.model : '<default>',
+        bound_tools: requestedTools,
+        bound_source: boundSource,
+        slug_prefixes: requestedSlugPrefixes,
+        max_concurrent: boundMaxConcurrent,
+        budget_remaining_cents: budgetCapCents,
+        prompt_byte_count: Buffer.byteLength(promptText, 'utf8'),
+        outcome: 'submitted',
+      });
+    } catch { /* never block submission */ }
+
+    return { id: job.id, name: 'subagent', client_id: clientId };
+  },
+};
+
 const get_job: Operation = {
   name: 'get_job',
   description: 'Get job status and details by ID',
@@ -3565,6 +3729,8 @@ export const operations: Operation[] = [
   // Jobs (Minions)
   submit_job, get_job, list_jobs, cancel_job, retry_job, get_job_progress,
   pause_job, resume_job, replay_job, send_job_message,
+  // v0.38 Slice 3: remote-callable agent dispatch with OAuth-bound trust boundary
+  submit_agent,
   // Orphans
   find_orphans,
   // v0.36.1.0 (T7) — Hindsight calibration wave: read profile via MCP

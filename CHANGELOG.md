@@ -215,6 +215,125 @@ in your check output. Federated-brain operators will see new
 
    This feedback loop is how the gbrain maintainers find fragile
    upgrade paths.
+## [0.38.1.0] - 2026-05-21
+
+**Your `gbrain agent run` loop can now run on any provider with native tool calling — not just Anthropic.** OpenAI, Google Gemini, OpenRouter, openai-compatible servers (Ollama, LiteLLM, vLLM, llama-server) all work. Pick the cheapest model that does the job for your agent, or stay on Anthropic if you want the prompt-cache cost savings on long loops.
+
+The pre-v0.38 subagent loop was Anthropic-direct: `new Anthropic()` instantiated inside the worker, the loop hard-pinned three layers deep because crash-replay reconciliation needed Anthropic's stable `tool_use_id`s. That pin is gone. The replay key is now gbrain-owned (uuid v7 + per-turn ordinal, persisted at first observation of each tool call) — the provider can return whatever id shape it wants and crash-replay still reconciles.
+
+How to turn it on:
+
+```bash
+gbrain config set agent.use_gateway_loop true
+gbrain config set models.tier.subagent openai:gpt-5.2     # or anthropic:claude-sonnet-4-6, google:gemini-1.5-pro, etc.
+gbrain agent run "research acme corp" --tools search,query --follow
+```
+
+The legacy Anthropic-direct path stays the default for one patch release so existing brains ship the same behavior on upgrade. Dogfood the new path locally, then flip the flag in the next release.
+
+What you'd see when picking providers:
+
+| Provider | Tool calls | Prompt caching | Notes |
+|---|---|---|---|
+| anthropic:claude-* | Yes | Yes | Cheapest on long loops thanks to cache; default |
+| openai:gpt-5.2 | Yes | No (implicit only) | Runs hot — cost scales linearly with conversation length |
+| google:gemini-1.5-pro | Yes | No | 1M-token context; good for big-context agents |
+| openrouter:* | Yes | Depends on underlying | The cost-arbitrage path |
+| openai-compatible (Ollama, LiteLLM, vLLM, llama-server) | If the model supports tools | No | Refused-at-submit when the model lacks tool calling |
+| voyage, zeroentropy | No chat touchpoint | n/a | Embeddings only — refused with a clear hint |
+
+`gbrain doctor` warns when your subagent tier resolves to a degraded provider (no prompt caching = higher cost) and refuses to dispatch when the provider doesn't support tool calling at all. The check is `subagent_capability` (was `subagent_provider`).
+
+**The remote MCP boundary also opens up — Cursor, Claude Code, ChatGPT can now launch gbrain agents over MCP**, not just observe them. The new op is `submit_agent`. Trust is bounded at OAuth client registration time: which tools the agent can call, which source/brain it can touch, which slug-prefixes it can write under, max concurrent jobs, and a per-client daily USD cap that uses a reserve-then-settle budget meter (the rate-leases.ts pattern over `pg_advisory_xact_lock`) so two concurrent agents from the same client can't both pre-flight at the cap boundary and bust it.
+
+To register a remote agent client (requires server-side gbrain v0.38+):
+
+```bash
+gbrain auth register-client cursor-agent \
+  --scopes read,agent \
+  --bound-tools search,get_page,put_page \
+  --bound-source default \
+  --bound-slug-prefixes wiki/ \
+  --bound-max-concurrent 3 \
+  --budget-usd-per-day 5.00
+```
+
+`gbrain` writes a JSONL audit row at `~/.gbrain/audit/agent-jobs-YYYY-Www.jsonl` per submission with (client, model, tools, slug_prefixes, max_concurrent, budget_remaining_cents, outcome). Prompt text itself never lands in the audit — only its byte count.
+
+Things to watch after upgrading:
+
+- `gbrain doctor` may warn `subagent_capability` if your `chat_model` is non-Anthropic and `ANTHROPIC_API_KEY` is unset and you haven't flipped `agent.use_gateway_loop=true` yet. The default still falls through the Anthropic-direct path; the warn surfaces this drift.
+- Existing `admin` OAuth clients do NOT automatically get the new `agent` scope. The two scopes are siblings (D13). Re-register with `--scopes admin,agent` and explicit bindings to opt in.
+- Mid-flight binary upgrade: jobs that were running with v0.37-shaped content_blocks reconcile via a read-time shim that recomputes the stable key from `(job_id, message_idx, content_blocks index, tool_name)`. No data migration; legacy rows replay correctly under the new key.
+- Migrations v82-v85 land on first `gbrain doctor` post-upgrade. (v81 was claimed by v0.38.0.0's `pages_provenance_columns`; v0.38.1.0's stable-ID + reservation + binding migrations renumbered up by one.)
+
+### What we built and how it slots together
+
+Four atomic slices behind feature flags, each shipping independently before the next:
+
+- **Slice 1** — gateway-native tool loop + stable IDs + v1→v2 shim. Pin removal at queue.ts, model-config rename, doctor check rename. Behind `agent.use_gateway_loop` (default off in this patch).
+- **Slice 2** — budget meter (reserve-then-settle via `pg_advisory_xact_lock`), `mcp_spend_reservations` table, `oauth_clients.budget_usd_per_day`.
+- **Slice 3** — `submit_agent` MCP op + `agent` OAuth scope + `oauth_clients.bound_*` columns + JSONL audit at `~/.gbrain/audit/agent-jobs-*.jsonl`.
+- **Slice 4** — admin `/admin/api/agents/spend` endpoint. Frontend wire-up follows in a near-term patch.
+
+### To take advantage of v0.38.1.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Try the new loop** (optional; off by default):
+   ```bash
+   gbrain config set agent.use_gateway_loop true
+   gbrain config set models.tier.subagent openai:gpt-5.2   # or your preferred provider
+   gbrain agent run "test the new loop" --tools search --follow
+   ```
+3. **Verify the schema** is at v85:
+   ```bash
+   gbrain doctor --json | grep schema_version
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+### Itemized changes
+
+**Added:**
+- `src/core/ai/capabilities.ts` — recipe-driven `getProviderCapabilities()` + `classifyCapabilities()` (5-state verdict: `ok` / `degraded:no_caching` / `degraded:no_parallel` / `unusable:no_tools` / `unknown`).
+- `src/core/ai/gateway.ts:toolLoop()` — provider-agnostic loop control wrapping `gateway.chat()`. Stateless beyond optional replay state; testable via existing `__setChatTransportForTests` seam.
+- `src/core/minions/budget-meter.ts` — reserve/settle/sweep + FNV-1a `clientLockKey` for `pg_advisory_xact_lock`.
+- `src/core/minions/agent-audit.ts` — ISO-week-rotated JSONL audit at `~/.gbrain/audit/agent-jobs-YYYY-Www.jsonl`. Never logs prompt text.
+- New MCP op `submit_agent` (scope `agent`, mutating, remote-callable) with per-dispatch binding enforcement.
+- `agent` OAuth scope (sibling to admin, NOT implied) + `oauth_clients.bound_tools` / `.bound_source_id` / `.bound_brain_id` / `.bound_slug_prefixes` / `.bound_max_concurrent` / `.budget_usd_per_day` columns.
+- `submit_agent` handler-time gateway-loop path inside `src/core/minions/handlers/subagent.ts`: builds `ChatToolDef[]` + `ToolHandler` Map from existing brain-tool registry, persists to v0.38 stable-ID columns at first observation, settles complete/failed on tool exit. D5 read-time shim adapts v1 Anthropic content blocks into v2 ChatBlock-shaped on read so crash-replay reconciles across the upgrade boundary.
+- Admin endpoint `GET /admin/api/agents/spend` returning per-client today's spend + pending reservations + inflight count.
+
+**Changed:**
+- `src/core/minions/queue.ts:87-106` — dropped `isAnthropicProvider` hard-reject; now refuses only on `unusable:no_tools` / `unknown` verdicts. Degraded providers pass with cost warn at first dispatch.
+- `src/core/model-config.ts:enforceSubagentAnthropic` → `enforceSubagentCapable`. Preserves once-per-(source,model) warn seam from v0.31.12. Legacy name kept as a thin back-compat wrapper.
+- `src/commands/doctor.ts:checkSubagentProvider` → `checkSubagentCapability`. Three verdict states: unusable, unknown, degraded:no_caching (cost regression warn).
+- `src/core/scope.ts` — `agent` added to allowed scopes (size 5 → 6). `IMPLIES` map keeps `agent` as a sibling, NOT implied by admin.
+- `src/core/operations.ts:operations` — `submit_agent` registered as a remote-safe mutating op alongside the existing Minions ops.
+
+**Migrations:**
+- v82 (`subagent_tool_executions_stable_id`) — adds `ordinal INTEGER`, `gbrain_tool_use_id UUID`, `UNIQUE(job_id, message_idx, ordinal)`. NULL-tolerant for legacy rows.
+- v83 (`mcp_spend_reservations`) — new table for reserve-then-settle pattern. Partial index on `(status, expires_at) WHERE status='pending'`.
+- v84 (`oauth_clients_budget_usd_per_day`) — `NUMERIC(10,2) NULL`.
+- v85 (`oauth_clients_agent_binding`) — bound_tools / bound_source_id (FK sources) / bound_brain_id / bound_slug_prefixes TEXT[] / bound_max_concurrent INTEGER DEFAULT 1.
+
+**Tests:**
+- `test/ai/capabilities.test.ts` (12 cases) — recipe-driven capability matrix across Anthropic / OpenAI / Google / Voyage (chat-touchpoint missing) / malformed input / unknown provider.
+- `test/ai/gateway-tool-loop.test.ts` (7 cases) — end stop_reason, single tool dispatch, callback ordering (write-ordering invariant), replay short-circuit on complete, non-idempotent pending replay throws unrecoverable, max_turns cap, refusal short-circuit.
+- `test/minions/budget-meter.test.ts` (15 cases) — FNV-1a determinism, reserve under/over cap, settle idempotency, sweep, getClientDailyCapCents.
+- `test/minions/agent-audit.test.ts` (7 cases) — ISO-week filename + year-boundary edge, JSONL append, NEVER logs prompt content.
+- `test/agent-cli.test.ts` updates — Layer 1/2/3 cases flipped: any tool-supporting provider passes; unknown / embedding-only provider refused.
+- `test/scope.test.ts` + `test/oauth.test.ts` + `test/model-config.serial.test.ts` updated for v0.38 semantics.
+
+**Plan:** `~/.claude/plans/system-instruction-you-are-working-shimmying-breeze.md`. Wave went through `/plan-ceo-review` (Option B locked), `/plan-eng-review` (7 decisions D3-D9), and two codex outside-voice rounds (D11-D13 absorbed; round 2 caught blocker on missing Slice 1 stable-ID migration + 4 non-blockers).
 
 ## [0.38.0.0] - 2026-05-21
 

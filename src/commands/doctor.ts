@@ -575,7 +575,7 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // so the user sees it at the next `gbrain doctor` run instead of at the
   // next subagent job submission. (Layers 1+2 also enforce — this is the
   // surfacing layer.)
-  checks.push(await checkSubagentProvider(engine));
+  checks.push(await checkSubagentCapability(engine));
 
   // 6. Sync freshness check
   checks.push(await checkSyncFreshness(engine));
@@ -1402,66 +1402,101 @@ export async function checkEvalDrift(engine: BrainEngine): Promise<Check> {
  * the loop at runtime. This check makes the configuration drift visible
  * before a job is submitted.
  */
-async function checkSubagentProvider(engine: BrainEngine): Promise<Check> {
+async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
   try {
-    const { isAnthropicProvider } = await import('../core/model-config.ts');
+    const { classifyCapabilities } = await import('../core/ai/capabilities.ts');
     const tierSubagent = await engine.getConfig('models.tier.subagent');
     const modelsDefault = await engine.getConfig('models.default');
 
-    // Tier-explicit override loses fail-loud since the user clearly meant it.
-    if (tierSubagent && !isAnthropicProvider(tierSubagent)) {
-      return {
-        name: 'subagent_provider',
-        status: 'warn',
-        message:
-          `models.tier.subagent is "${tierSubagent}" but the subagent loop is Anthropic-only. ` +
-          `Runtime will fall back to claude-sonnet-4-6. Fix: ` +
-          `\`gbrain config set models.tier.subagent anthropic:claude-sonnet-4-6\`.`,
-      };
-    }
-    // models.default sneaking subagent into a non-Anthropic provider.
-    if (!tierSubagent && modelsDefault && !isAnthropicProvider(modelsDefault)) {
-      return {
-        name: 'subagent_provider',
-        status: 'warn',
-        message:
-          `models.default is "${modelsDefault}" which would route subagent jobs to a non-Anthropic provider. ` +
-          `Runtime falls back to claude-sonnet-4-6 for subagent only. ` +
-          `Fix: \`gbrain config set models.tier.subagent anthropic:claude-sonnet-4-6\` to lock it in.`,
-      };
-    }
+    // Helper: explain a verdict in user-facing terms.
+    const explain = (resolved: string, source: string): Check | null => {
+      const verdict = classifyCapabilities(resolved);
+      if (verdict === 'unusable:no_tools') {
+        return {
+          name: 'subagent_capability',
+          status: 'warn',
+          message:
+            `${source} is "${resolved}" but that provider/model lacks native tool calling. ` +
+            `The subagent loop cannot run on this model — runtime will fall back to claude-sonnet-4-6. ` +
+            `Fix: \`gbrain config set ${source} <provider>:<model-with-tools>\` (e.g. anthropic:claude-sonnet-4-6 or openai:gpt-5.2).`,
+        };
+      }
+      if (verdict === 'unknown') {
+        return {
+          name: 'subagent_capability',
+          status: 'warn',
+          message:
+            `${source} is "${resolved}" which references an unknown provider. ` +
+            `Use a recipe-declared provider. ` +
+            `Fix: \`gbrain config set ${source} anthropic:claude-sonnet-4-6\` or pick another known provider.`,
+        };
+      }
+      if (verdict === 'degraded:no_caching') {
+        return {
+          name: 'subagent_capability',
+          status: 'warn',
+          message:
+            `${source} is "${resolved}" — provider does not support prompt caching. ` +
+            `The subagent loop runs hot (cost scales linearly with conversation length). ` +
+            `For lower cost on long loops, use an Anthropic model: ` +
+            `\`gbrain config set models.tier.subagent anthropic:claude-sonnet-4-6\`.`,
+        };
+      }
+      return null;
+    };
 
-    // v0.37 (T10 / D7): warn when the configured chat_model is non-Anthropic
-    // AND ANTHROPIC_API_KEY isn't set. Subagent jobs require Anthropic
-    // regardless of chat_model (minions/queue.ts:97 enforces this); without
-    // the key, gbrain dream / gbrain agent run / gbrain autopilot will all
-    // fail at first job submission. Catches the post-init drift case the
-    // init-time caveat would have shown if init had been re-run.
+    if (tierSubagent) {
+      const issue = explain(tierSubagent, 'models.tier.subagent');
+      if (issue) return issue;
+    } else if (modelsDefault) {
+      const issue = explain(modelsDefault, 'models.default');
+      if (issue) return issue;
+    }
+    // v0.37 (T10 / D7) + v0.38 (D7 capability rename): warn when the configured
+    // chat_model is non-Anthropic AND ANTHROPIC_API_KEY isn't set. With
+    // agent.use_gateway_loop=false (the v0.38 default), subagent jobs still
+    // require Anthropic at runtime; without the key, gbrain dream / gbrain
+    // agent run / gbrain autopilot will all fail at job submission. Catches
+    // the post-init drift case the init-time caveat would have shown if init
+    // had been re-run.
     try {
       const { loadConfig } = await import('../core/config.ts');
       const cfg = loadConfig();
       const chatModel = cfg?.chat_model;
+      const { isAnthropicProvider } = await import('../core/model-config.ts');
       if (chatModel && !isAnthropicProvider(chatModel) && !process.env.ANTHROPIC_API_KEY) {
         return {
-          name: 'subagent_provider',
+          name: 'subagent_capability',
           status: 'warn',
           message:
             `chat_model is "${chatModel}" (non-Anthropic) and ANTHROPIC_API_KEY is not set. ` +
-            `Subagent features (gbrain dream, gbrain agent run, gbrain autopilot) will fail at job submission. ` +
-            `Chat alone (gbrain think) still works. Set ANTHROPIC_API_KEY before running subagent commands.`,
+            `Subagent features (gbrain dream, gbrain agent run, gbrain autopilot) will fail at job submission ` +
+            `unless agent.use_gateway_loop=true. Chat alone (gbrain think) still works. ` +
+            `Either set ANTHROPIC_API_KEY or enable: \`gbrain config set agent.use_gateway_loop true\`.`,
         };
       }
     } catch { /* loadConfig may throw; fall through */ }
 
-    return { name: 'subagent_provider', status: 'ok', message: 'Subagent tier resolves to Anthropic' };
+    return {
+      name: 'subagent_capability',
+      status: 'ok',
+      message: tierSubagent
+        ? `Subagent tier resolves to "${tierSubagent}" with full tool-loop capability`
+        : `Subagent tier resolves to default (claude-sonnet-4-6) — full tool-loop capability`,
+    };
   } catch (e) {
     return {
-      name: 'subagent_provider',
+      name: 'subagent_capability',
       status: 'warn',
-      message: `Could not check subagent provider: ${e instanceof Error ? e.message : String(e)}`,
+      message: `Could not check subagent capability: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
 }
+
+// v0.38 — `checkSubagentProvider` was renamed to `checkSubagentCapability` (D7).
+// Back-compat alias preserved for any external doctor extensions importing it.
+const checkSubagentProvider = checkSubagentCapability;
+void checkSubagentProvider;
 
 // Module-scoped flag so the NaN-fallback warning fires once per process.
 let _syncFreshnessEnvWarned = false;
@@ -3750,13 +3785,13 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     }
   }
 
-  // 11.4 subagent_provider (v0.31.12 — Codex F13 layer 3 of 3). Surfaces a
+  // 11.4 subagent_capability (v0.38 — D7; was subagent_provider in v0.31.12). Surfaces a
   // warn when models.tier.subagent or models.default points at a non-Anthropic
   // provider. Layers 1 (queue.ts submit-time) and 2 (handler runtime) also
   // enforce; this is the surfacing layer so users see the config drift before
   // a job is submitted.
-  progress.heartbeat('subagent_provider');
-  checks.push(await checkSubagentProvider(engine));
+  progress.heartbeat('subagent_capability');
+  checks.push(await checkSubagentCapability(engine));
 
   // 11.5 facts_health (v0.31 hot memory). Surfaces per-source counters so
   // operators can see the extraction pipeline's pulse without raw SQL.
