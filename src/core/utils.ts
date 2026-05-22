@@ -44,21 +44,23 @@ export function contentHash(page: PageInput): string {
 }
 
 /**
- * v0.32.8: validate a `source_id` is safe for use as a filesystem path
- * segment AND as a SQL identifier value. Used by the per-source disk-layout
- * fix in patterns.ts/synthesize.ts before any `join(brainDir, source_id, ...)`
+ * Validate a `source_id` is safe for use as a filesystem path segment AND
+ * as a SQL identifier value. Used by the per-source disk-layout code in
+ * patterns.ts/synthesize.ts before any `join(brainDir, source_id, ...)`
  * call, and at `putSource()` time so invalid ids never make it into the DB.
  *
- * Allows lowercase ASCII letters, digits, underscore, and hyphen. Rejects
- * `..`, `/`, spaces, dots, and any non-ASCII character. Path-traversal and
- * SQL-injection safe by construction.
+ * **v0.38 (codex r2 P1-C, P1-D):** consolidated to import from
+ * `src/core/source-id.ts` (dependency-free canonical module). The regex
+ * TIGHTENED from the permissive `^[a-z0-9_-]+$` to the strict kebab-case
+ * `^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$` — same regex `sources-ops` has
+ * always enforced at creation time. Closes the drift between path-safety
+ * and creation-time validation; no production source IDs break (none had
+ * underscores, since `sources-ops` always rejected them).
+ *
+ * Re-exported here for back-compat with the pre-v0.38 `validateSourceId`
+ * import. New code should import directly from `source-id.ts`.
  */
-const SOURCE_ID_RE = /^[a-z0-9_-]+$/;
-export function validateSourceId(id: string): void {
-  if (!SOURCE_ID_RE.test(id)) {
-    throw new Error(`Invalid source_id "${id}" — must match ${SOURCE_ID_RE}`);
-  }
-}
+export { assertValidSourceId as validateSourceId } from './source-id.ts';
 
 function readOptionalDate(raw: unknown): Date | null | undefined {
   // Three-state read for columns that may or may not be in the SELECT
