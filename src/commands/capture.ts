@@ -31,6 +31,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import matter from 'gray-matter';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
@@ -129,26 +130,98 @@ async function readStdin(): Promise<string> {
 }
 
 /**
+ * Derive a title from the first non-empty, non-`---` line of the body,
+ * stripping leading markdown heading marks, capped at 80 chars.
+ * Falls back to 'Capture' when no usable line exists.
+ */
+function deriveTitle(rawBody: string): string {
+  const firstLine = rawBody
+    .split('\n')
+    .find((l) => l.trim().length > 0 && l.trim() !== '---') ?? '';
+  return firstLine.replace(/^#+\s*/, '').slice(0, 80) || 'Capture';
+}
+
+/**
+ * v0.38.3.0 (BUG-1): merge capture's auto-stamped fields with any existing
+ * frontmatter in `rawBody`, rather than always prepending a second
+ * frontmatter block. The pre-fix code stamped its own `---` block on top
+ * of files that already had frontmatter, producing `title: '---'` (the
+ * file's opening delimiter became the outer title) and two consecutive
+ * frontmatter blocks the parser interpreted as the outer block + a body
+ * starting with a horizontal rule.
+ *
+ * Precedence rules (user-wins by default):
+ *   - `type`:         opts.type (CLI flag) > userFm.type > 'note'
+ *   - `title`:        userFm.title > derived-from-body
+ *   - `captured_via`: userFm.captured_via > opts.source > 'capture-cli'
+ *                     (CV3/Phase 3c will narrow this to always 'capture-cli';
+ *                     for Phase 2a we preserve current semantics)
+ *   - `captured_at`:  userFm.captured_at > now (user can pre-stamp for retroactive
+ *                     captures; see CQ2 test case 4)
+ *   - Any other user-declared keys (description, tags, slug, etc.) pass through verbatim.
+ *
+ * For files WITHOUT existing frontmatter, preserves the original behavior:
+ * stamps a fresh frontmatter block, and if the body doesn't already look
+ * like markdown (no `#` heading), wraps it under a `# {title}` heading.
+ */
+export function mergeCaptureFrontmatter(rawBody: string, opts: RunOpts): string {
+  const nowIso = new Date().toISOString();
+  // Detect frontmatter: leading `---\n` or `---\r\n`, tolerating leading BOM/whitespace.
+  // We do NOT use the more permissive `startsWith('---')` because a body that opens
+  // with a horizontal-rule like `--- separator ---` would false-positive.
+  const trimmedStart = rawBody.replace(/^﻿/, '');
+  const hasFrontmatter = /^---\r?\n/.test(trimmedStart);
+
+  if (!hasFrontmatter) {
+    // No existing frontmatter: stamp a fresh block and (if body lacks markdown
+    // structure) wrap under a derived heading.
+    const title = deriveTitle(rawBody);
+    const fm: Record<string, unknown> = {
+      type: opts.type ?? 'note',
+      title,
+      captured_via: opts.source ?? 'capture-cli',
+      captured_at: nowIso,
+    };
+    const looksMarkdown = /^#{1,6}\s/.test(rawBody.trimStart());
+    const body = looksMarkdown ? rawBody : `# ${title}\n\n${rawBody}`;
+    return matter.stringify(body, fm);
+  }
+
+  // Existing frontmatter: parse, merge user-wins, re-emit as a SINGLE block.
+  let parsed: matter.GrayMatterFile<string>;
+  try {
+    parsed = matter(rawBody);
+  } catch (e) {
+    throw new Error(
+      `malformed frontmatter in capture input: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  const userFm = (parsed.data ?? {}) as Record<string, unknown>;
+  const merged: Record<string, unknown> = {
+    // Spread user's declared keys first so 'description', 'tags', etc. pass through.
+    ...userFm,
+    // Then apply auto-fields with the precedence rules above. The explicit
+    // assignment AFTER the spread is intentional: it lets us implement the
+    // mixed precedence (CLI flag wins for `type`; user wins for `title`/
+    // `captured_via`/`captured_at`) in one expression per key.
+    type: opts.type ?? userFm.type ?? 'note',
+    title: userFm.title ?? deriveTitle(parsed.content),
+    captured_via: userFm.captured_via ?? opts.source ?? 'capture-cli',
+    captured_at: userFm.captured_at ?? nowIso,
+  };
+  return matter.stringify(parsed.content, merged);
+}
+
+/**
  * Build the put_page content (frontmatter + body). The user's --type and
  * the auto-stamped capture provenance go in the frontmatter so future
  * tools (e.g. the inbox triage UI) can find captures.
+ *
+ * v0.38.3.0: delegates to `mergeCaptureFrontmatter` so files with existing
+ * frontmatter merge instead of double-wrap (BUG-1).
  */
 function buildContent(rawBody: string, opts: RunOpts): string {
-  const frontmatterLines: string[] = ['---'];
-  frontmatterLines.push(`type: ${opts.type ?? 'note'}`);
-  // Title defaults to the first non-empty line of the body, capped at 80 chars.
-  const firstLine = rawBody.split('\n').find((l) => l.trim().length > 0) ?? '';
-  const title = firstLine.replace(/^#+\s*/, '').slice(0, 80) || 'Capture';
-  frontmatterLines.push(`title: ${JSON.stringify(title)}`);
-  frontmatterLines.push(`captured_via: ${opts.source ?? 'capture-cli'}`);
-  frontmatterLines.push(`captured_at: ${new Date().toISOString()}`);
-  frontmatterLines.push('---');
-  // Heuristic: if the raw body doesn't already look like markdown (no headings,
-  // no leading frontmatter), wrap in a heading for readability. Inline thoughts
-  // are usually unstructured.
-  const lookskMarkdown = /^#{1,6}\s/.test(rawBody.trimStart()) || rawBody.startsWith('---');
-  const body = lookskMarkdown ? rawBody : `# ${title}\n\n${rawBody}`;
-  return frontmatterLines.join('\n') + '\n\n' + body;
+  return mergeCaptureFrontmatter(rawBody, opts);
 }
 
 interface CaptureResult {
@@ -318,5 +391,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
 export const __testing = {
   defaultSlug,
   buildContent,
+  mergeCaptureFrontmatter,
+  deriveTitle,
   parseArgs,
 };
