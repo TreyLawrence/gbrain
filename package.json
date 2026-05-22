@@ -25,7 +25,9 @@
     "./search/hybrid": "./src/core/search/hybrid.ts",
     "./search/expansion": "./src/core/search/expansion.ts",
     "./ai/gateway": "./src/core/ai/gateway.ts",
-    "./extract": "./src/commands/extract.ts"
+    "./extract": "./src/commands/extract.ts",
+    "./ingestion": "./src/core/ingestion/index.ts",
+    "./ingestion/test-harness": "./src/core/ingestion/test-harness.ts"
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
@@ -93,6 +95,7 @@
     "@jsquash/png": "^3.1.1",
     "@modelcontextprotocol/sdk": "1.29.0",
     "ai": "^6.0.168",
+    "chokidar": "^4.0.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "eventsource-parser": "^3.0.8",

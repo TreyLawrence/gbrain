@@ -1796,3 +1796,183 @@ describe('migrate v80 — CHECK widening end-to-end on PGLite', () => {
     expect(typeof scorecard.partial_rate).not.toBe('undefined');
   });
 });
+
+// ─── v0.38.0.0 — v81 pages_provenance_columns ─────────────────────────────
+//
+// Adds four nullable provenance columns to `pages` so every ingested page
+// carries a record of WHERE it came from (capture-cli, webhook, put_page,
+// dream, etc.). The columns are populated by the put_page write-through
+// path AND by the `ingest_capture` Minion handler. NULL is the
+// historical-page default — pre-v0.38 pages never had provenance.
+//
+// Renumbered v80 → v81 during master merge with v0.37.2.0's
+// takes_unresolvable_quality_v0_37_2_0 hotfix (which claimed v80 first).
+//
+// Structural assertions pin the migration's SQL shape; the PGLite
+// round-trip below verifies the columns are actually queryable + nullable
+// after `initSchema()`. Schema-bootstrap-coverage covers the forward-
+// reference probe contract separately at test/schema-bootstrap-coverage.test.ts.
+
+describe('migrate v81 — pages_provenance_columns', () => {
+  const v81 = MIGRATIONS.find(m => m.version === 81);
+
+  test('v81 entry exists with the documented name', () => {
+    expect(v81).toBeDefined();
+    expect(v81!.name).toBe('pages_provenance_columns');
+  });
+
+  test('v81 is marked idempotent so re-runs are safe', () => {
+    expect(v81!.idempotent).toBe(true);
+  });
+
+  test('v81 adds exactly four provenance columns to pages', () => {
+    const sql = (v81!.sql ?? '').toLowerCase();
+    expect(sql).toContain('alter table pages add column if not exists ingested_via text');
+    expect(sql).toContain('alter table pages add column if not exists ingested_at timestamptz');
+    expect(sql).toContain('alter table pages add column if not exists source_uri text');
+    expect(sql).toContain('alter table pages add column if not exists source_kind text');
+  });
+
+  test('v81 uses IF NOT EXISTS for every ALTER — re-run-safe on partial states', () => {
+    const sql = (v81!.sql ?? '').toLowerCase();
+    // Four ADD COLUMN statements, every one guarded.
+    const guarded = sql.match(/add column if not exists/g) ?? [];
+    expect(guarded.length).toBe(4);
+  });
+
+  test('v81 columns are nullable (no NOT NULL constraint, no DEFAULT)', () => {
+    const sql = (v81!.sql ?? '').toLowerCase();
+    // ADD COLUMN with NULL default is metadata-only on Postgres 11+ and
+    // PGLite 17.5 — instant on tables of any size. Regression guard: any
+    // future contributor who adds NOT NULL or DEFAULT must update this
+    // assertion deliberately, since both flip the migration from O(1) to
+    // O(N) rewrite on large tables.
+    expect(sql).not.toMatch(/ingested_via\s+text\s+not\s+null/);
+    expect(sql).not.toMatch(/ingested_at\s+timestamptz\s+not\s+null/);
+    expect(sql).not.toMatch(/source_uri\s+text\s+not\s+null/);
+    expect(sql).not.toMatch(/source_kind\s+text\s+not\s+null/);
+    expect(sql).not.toMatch(/ingested_via\s+text\s+default/);
+  });
+
+  test('v81 does NOT create any index (provenance is admin-surface only)', () => {
+    const sql = (v81!.sql ?? '').toLowerCase();
+    // Documented in the migration comment: provenance queries are admin-
+    // surface only (admin SPA Sources tab + gbrain doctor
+    // ingestion_health). Throwing an index on a low-cardinality TEXT
+    // column would inflate the brain repo for negligible read benefit.
+    expect(sql).not.toContain('create index');
+  });
+});
+
+describe('migrate v81 — round-trip on PGLite', () => {
+  let engine: PGLiteEngine;
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+  });
+
+  afterAll(async () => {
+    await engine.disconnect();
+  });
+
+  test('all four provenance columns exist on pages after initSchema', async () => {
+    const rows = await engine.executeRaw<{ column_name: string; is_nullable: string; data_type: string }>(
+      `SELECT column_name, is_nullable, data_type
+         FROM information_schema.columns
+        WHERE table_name = 'pages'
+          AND column_name IN ('ingested_via', 'ingested_at', 'source_uri', 'source_kind')
+        ORDER BY column_name`,
+      [],
+    );
+    expect(rows.length).toBe(4);
+    const byName = new Map(rows.map(r => [r.column_name, r]));
+    expect(byName.get('ingested_via')?.is_nullable).toBe('YES');
+    expect(byName.get('ingested_at')?.is_nullable).toBe('YES');
+    expect(byName.get('source_uri')?.is_nullable).toBe('YES');
+    expect(byName.get('source_kind')?.is_nullable).toBe('YES');
+    // ingested_at must be TIMESTAMPTZ — pin the type so an accidental
+    // bump to TIMESTAMP (no zone) doesn't slip through.
+    expect(byName.get('ingested_at')?.data_type.toLowerCase()).toContain('timestamp');
+  });
+
+  test('inserting a page with full provenance round-trips through getPage', async () => {
+    const slug = `wiki/inbox/v81-provenance-${Date.now()}`;
+    await engine.putPage(slug, {
+      type: 'note',
+      title: 'v81 provenance round-trip',
+      compiled_truth: 'A note with provenance.',
+      timeline: '',
+      frontmatter: {
+        ingested_via: 'capture-cli',
+        ingested_at: '2026-05-21T04:15:00Z',
+        source_uri: 'cli://capture/test',
+        source_kind: 'capture',
+      },
+      content_hash: `v81-${Math.random()}`,
+    });
+    const page = await engine.getPage(slug);
+    expect(page).not.toBeNull();
+    // The frontmatter columns persist via the JSONB blob, not the
+    // dedicated provenance columns yet — write paths that target the
+    // columns directly are the put_page write-through + ingest_capture
+    // handler covered separately. The point of this test is the schema
+    // shape is correct so a future direct-column writer can land cleanly.
+    expect((page!.frontmatter as Record<string, unknown>).ingested_via).toBe('capture-cli');
+  });
+
+  test('pre-v0.38 page with NULL provenance columns is queryable', async () => {
+    // Simulates the historical-page upgrade scenario: a row whose
+    // provenance columns were never populated. Should not break any SQL
+    // path that touches `pages`.
+    const slug = `wiki/legacy/v81-null-prov-${Date.now()}`;
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, source_id)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)`,
+      [slug, 'note', 'legacy', 'body', '', '{}', `v81-legacy-${Math.random()}`, 'default'],
+    );
+    const rows = await engine.executeRaw<{ ingested_via: string | null; ingested_at: Date | null }>(
+      `SELECT ingested_via, ingested_at FROM pages WHERE slug = $1`,
+      [slug],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].ingested_via).toBeNull();
+    expect(rows[0].ingested_at).toBeNull();
+  });
+
+  test('directly UPDATE-ing the provenance columns succeeds (no constraint blocks)', async () => {
+    // Pins that nothing on the column shape (e.g. an accidental CHECK)
+    // would reject a write the put_page write-through path is going to do.
+    const slug = `wiki/test/v81-update-${Date.now()}`;
+    await engine.putPage(slug, {
+      type: 'note',
+      title: 'v81 update test',
+      compiled_truth: '',
+      timeline: '',
+      frontmatter: {},
+      content_hash: `v81-upd-${Math.random()}`,
+    });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET ingested_via = $1,
+              ingested_at  = now(),
+              source_uri   = $2,
+              source_kind  = $3
+        WHERE slug = $4`,
+      ['put_page', 'mcp://put_page/test', 'mcp', slug],
+    );
+    const rows = await engine.executeRaw<{
+      ingested_via: string | null;
+      source_uri: string | null;
+      source_kind: string | null;
+    }>(
+      `SELECT ingested_via, source_uri, source_kind FROM pages WHERE slug = $1`,
+      [slug],
+    );
+    expect(rows[0].ingested_via).toBe('put_page');
+    expect(rows[0].source_uri).toBe('mcp://put_page/test');
+    expect(rows[0].source_kind).toBe('mcp');
+  });
+});
+

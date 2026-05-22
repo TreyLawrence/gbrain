@@ -3768,20 +3768,249 @@ export const MIGRATIONS: Migration[] = [
   },
   {
     version: 81,
+    name: 'pages_provenance_columns',
+    // v0.38 ingestion cathedral (eng review E4):
+    // Adds four nullable provenance columns to `pages` so every ingested
+    // page carries a record of WHERE it came from. The columns are
+    // populated by the ingest_capture Minion handler (via the put_page
+    // write-through path landing in a sibling commit). NULL is the
+    // historical-page default — pre-v0.38 pages never had provenance.
+    //
+    //   - ingested_via    TEXT  — source kind taxonomy
+    //                             (file-watcher | inbox-folder | webhook |
+    //                              cron-scheduler | capture-cli |
+    //                              <skillpack-kind>)
+    //   - ingested_at     TIMESTAMPTZ — UTC time the ingestion daemon
+    //                                   accepted the event
+    //   - source_uri      TEXT  — original URI/path/message-id the event
+    //                             carried (file path, mail message-id, URL)
+    //   - source_kind     TEXT  — duplicates ingested_via for indexed
+    //                             filtering convenience (one column for
+    //                             "type of source", one for richer label
+    //                             — kept narrow + indexable separately)
+    //
+    // ADD COLUMN with NULL default is metadata-only on Postgres 11+ and
+    // PGLite 17.5 — instant on tables of any size.
+    //
+    // No index: provenance queries are admin-surface only.
+    //
+    // Forward-reference bootstrap: every brain that upgrades through this
+    // version needs the columns visible to the embedded SCHEMA_SQL replay
+    // BEFORE migrations run. applyForwardReferenceBootstrap on both
+    // engines covers this; REQUIRED_BOOTSTRAP_COVERAGE pins the contract.
+    //
+    // Renumbered v80→v81 during master merge with v0.37.2.0's
+    // takes_unresolvable_quality hotfix.
+    idempotent: true,
+    sql: `
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS ingested_via TEXT NULL;
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ NULL;
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS source_uri TEXT NULL;
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS source_kind TEXT NULL;
+    `,
+  },
+  {
+    version: 82,
+    name: 'subagent_tool_executions_stable_id',
+    // v0.38 Slice 1 — D11 stable-ID columns. The pre-v81 reconciliation key
+    // for crash-replay was `(job_id, tool_use_id)` where tool_use_id came from
+    // the Anthropic Messages API. That was load-bearing for the v0.15 crash-
+    // replay guarantee but tied the loop to Anthropic-direct. The provider-
+    // agnostic loop assigns its own ordinal at FIRST observation of a tool
+    // call in a turn; that ordinal + gbrain_tool_use_id (uuid v7) become the
+    // canonical reconciliation key. The provider's own tool_use_id stays as a
+    // side channel for debugging.
+    //
+    // Migration shape:
+    //   - ordinal INTEGER NULL: legacy rows have NULL; new writes always set
+    //     a value. UNIQUE on (job_id, message_idx, ordinal) treats multiple
+    //     NULL ordinals as distinct (Postgres semantics), so legacy rows
+    //     don't collide with each other or with new writes.
+    //   - gbrain_tool_use_id UUID NULL: same NULL semantics; populated at
+    //     write time post-Slice-1, NULL on legacy rows.
+    //   - Existing constraint uniq_subagent_tools_use_id (job_id, tool_use_id)
+    //     is preserved — provider IDs stay deduplicated within a job.
+    //   - The read-time D5 shim recomputes a stable key for legacy rows from
+    //     (job_id, message_idx, content_blocks index, tool_name); no data
+    //     migration needed.
+    //
+    // ADD COLUMN with no DEFAULT (NULL) is metadata-only on Postgres 11+ and
+    // PGLite 17.5 — instant on tables of any size. The UNIQUE constraint
+    // builds a partial index; on a typical brain with ~hundreds of subagent
+    // rows this is sub-millisecond.
+    idempotent: true,
+    sql: `
+      ALTER TABLE subagent_tool_executions
+        ADD COLUMN IF NOT EXISTS ordinal INTEGER,
+        ADD COLUMN IF NOT EXISTS gbrain_tool_use_id UUID;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'subagent_tool_executions_stable_id'
+        ) THEN
+          ALTER TABLE subagent_tool_executions
+            ADD CONSTRAINT subagent_tool_executions_stable_id
+            UNIQUE (job_id, message_idx, ordinal);
+        END IF;
+      END$$;
+    `,
+    sqlFor: {
+      // PGLite doesn't support DO blocks; pglite-schema.ts CREATE TABLE
+      // already includes the constraint on fresh installs, so this migration
+      // is a no-op when the constraint exists. DROP-IF-EXISTS + ADD pattern
+      // is idempotent and rebuilds the UNIQUE index (instant on small tables).
+      pglite: `
+        ALTER TABLE subagent_tool_executions
+          ADD COLUMN IF NOT EXISTS ordinal INTEGER;
+        ALTER TABLE subagent_tool_executions
+          ADD COLUMN IF NOT EXISTS gbrain_tool_use_id UUID;
+        ALTER TABLE subagent_tool_executions
+          DROP CONSTRAINT IF EXISTS subagent_tool_executions_stable_id;
+        ALTER TABLE subagent_tool_executions
+          ADD CONSTRAINT subagent_tool_executions_stable_id
+          UNIQUE (job_id, message_idx, ordinal);
+      `,
+    },
+  },
+  {
+    version: 83,
+    name: 'mcp_spend_reservations',
+    // v0.38 Slice 2 — D3 + codex P2 — reserve-then-settle budget pattern.
+    //
+    // The pre-v82 spend-tracking flow was: take the call, sum mcp_spend_log,
+    // refuse next call when over cap. Race condition: two concurrent agents
+    // from the same client both pre-flight pass at $2 of $5 cap, both spend,
+    // both bust the cap. This table holds in-flight reservations under
+    // pg_advisory_xact_lock(client_id) so the SUM-then-INSERT is atomic.
+    //
+    // Lifecycle:
+    //   pending  → settled  (call returned; actual_cents recorded)
+    //   pending  → expired  (call crashed; sweeper marks; actual=0)
+    //
+    // The TTL sweeper runs on every reserve (cheap when no expired rows).
+    // Partial index on (status, expires_at) WHERE status='pending' keeps
+    // the sweeper fast even when the settled history grows large.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS mcp_spend_reservations (
+        reservation_id UUID PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        job_id BIGINT NULL REFERENCES minion_jobs(id) ON DELETE SET NULL,
+        estimated_cents NUMERIC(12, 4) NOT NULL,
+        actual_cents NUMERIC(12, 4) NULL,
+        model TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'expired')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        settled_at TIMESTAMPTZ NULL,
+        expires_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_mcp_spend_reservations_client_time
+        ON mcp_spend_reservations (client_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_mcp_spend_reservations_pending_expires
+        ON mcp_spend_reservations (status, expires_at)
+        WHERE status = 'pending';
+    `,
+  },
+  {
+    version: 85,
+    name: 'oauth_clients_agent_binding',
+    // v0.38 Slice 3 — D13 + codex P1 + P2 — registration-time binding for
+    // OAuth clients that hold the `agent` scope. The binding fields are
+    // each-or-nothing: if the client's allowed_scopes includes 'agent', the
+    // registrar MUST pass all five binding flags. The submit_agent op
+    // validates each param against the binding row at dispatch time.
+    //
+    //   - bound_tools TEXT[]: subset of brain-safe ops this client may
+    //     reference in submit_agent allowed_tools.
+    //   - bound_source_id TEXT: which source (database axis) the agent
+    //     writes to. FK to sources.id with ON DELETE SET NULL so a
+    //     source-delete doesn't dangling-reference the client.
+    //   - bound_brain_id TEXT: which mounted brain (multi-brain installs).
+    //   - bound_slug_prefixes TEXT[]: put_page namespace allowlist.
+    //   - bound_max_concurrent INTEGER: per-client concurrency cap on
+    //     in-flight subagent jobs.
+    //
+    // All NULL on pre-v84 clients. The submit_agent op refuses dispatch
+    // when scope='agent' is present but bindings are NULL — opt-in only.
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS bound_tools TEXT[] NULL,
+        ADD COLUMN IF NOT EXISTS bound_source_id TEXT NULL,
+        ADD COLUMN IF NOT EXISTS bound_brain_id TEXT NULL,
+        ADD COLUMN IF NOT EXISTS bound_slug_prefixes TEXT[] NULL,
+        ADD COLUMN IF NOT EXISTS bound_max_concurrent INTEGER NOT NULL DEFAULT 1;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'fk_oauth_clients_bound_source'
+        ) THEN
+          BEGIN
+            ALTER TABLE oauth_clients
+              ADD CONSTRAINT fk_oauth_clients_bound_source
+              FOREIGN KEY (bound_source_id)
+              REFERENCES sources(id) ON DELETE SET NULL;
+          EXCEPTION WHEN others THEN
+            -- sources table may not exist on minimal installs; skip silently.
+            NULL;
+          END;
+        END IF;
+      END$$;
+    `,
+    sqlFor: {
+      pglite: `
+        ALTER TABLE oauth_clients
+          ADD COLUMN IF NOT EXISTS bound_tools TEXT[] NULL;
+        ALTER TABLE oauth_clients
+          ADD COLUMN IF NOT EXISTS bound_source_id TEXT NULL;
+        ALTER TABLE oauth_clients
+          ADD COLUMN IF NOT EXISTS bound_brain_id TEXT NULL;
+        ALTER TABLE oauth_clients
+          ADD COLUMN IF NOT EXISTS bound_slug_prefixes TEXT[] NULL;
+        ALTER TABLE oauth_clients
+          ADD COLUMN IF NOT EXISTS bound_max_concurrent INTEGER NOT NULL DEFAULT 1;
+      `,
+    },
+  },
+  {
+    version: 84,
+    name: 'oauth_clients_budget_usd_per_day',
+    // v0.38 Slice 2 — D2 + D3 — per-OAuth-client daily budget cap.
+    //
+    // Pre-v84 the daily cap lived in a per-search-image config key. This
+    // column makes it a first-class property of each OAuth client and lets
+    // `gbrain auth register-client --budget-usd-per-day N` persist the cap
+    // alongside scope. NULL = no cap (current pre-v84 behavior).
+    //
+    // Column-only; metadata-only on Postgres 11+ and PGLite 17.5.
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS budget_usd_per_day NUMERIC(10, 2) NULL;
+    `,
+  },
+  {
+    version: 86,
     name: 'page_links_view_alias',
-    // v0.38 — pglite-engine.ts and postgres-engine.ts both query a relation
+    // v0.39 — pglite-engine.ts and postgres-engine.ts both query a relation
     // named `page_links` (LEFT JOIN page_links pl ON pl.to_page_id = p.id —
     // see pglite-engine.ts:896 / postgres-engine.ts:959). The canonical
     // table has always been `links`. This migration installs a `page_links`
-    // VIEW that aliases the table so brains initialized before the v0.38
+    // VIEW that aliases the table so brains initialized before the v0.39
     // schema bundle pick up the alias on upgrade.
     //
     // Fresh installs already get the view via the embedded schema bundle.
     // This migration is idempotent (CREATE OR REPLACE VIEW) so re-running
     // is safe on either engine.
     //
-    // Discovered during the brainstorm-cathedral wave when the E2E test had
-    // to workaround the missing view to exercise the resume path.
+    // Discovered during the brainstorm-cathedral wave (v0.39.0.0) when the
+    // E2E test had to workaround the missing view to exercise the resume
+    // path. Originally numbered v81; renumbered to v86 during merge with
+    // master's v0.38 cathedrals (provenance / subagent / spend / oauth
+    // binding) which claimed v81-v85.
     //
     // Narrow projection (id, from_page_id, to_page_id) so the view does not
     // depend on columns added in later migrations (link_source,
