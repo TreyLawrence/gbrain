@@ -22,6 +22,7 @@ import {
   type BrainstormProfile,
 } from '../core/brainstorm/orchestrator.ts';
 import { loadConfig } from '../core/config.ts';
+import { StructuredAgentError } from '../core/errors.ts';
 
 export interface BrainstormCliArgs {
   question?: string;
@@ -156,11 +157,34 @@ async function runBrainstormCli(
     ? { ...profile, m_far: parsed.limit }
     : profile;
 
-  const result = await runBrainstorm(engine, config, {
-    question: parsed.question,
-    profile: effectiveProfile,
-    skipCostPreview: skipPreview,
-  });
+  // v0.38.3.0 WARN-10 + CV11 — catch StructuredAgentError 'brainstorm_timeout'
+  // surfaced by the orchestrator and format it like the cli.ts:188-191
+  // OperationError block (Error [code]: message + Hint line + exit 1).
+  // Non-typed errors fall through to the existing dispatcher's catch.
+  // Without this CLI formatter, the typed error reaches main()'s generic
+  // catch which prints `e.message` only — losing the structured `.hint`
+  // field that's the whole point of the orchestrator-level wrap.
+  let result;
+  try {
+    result = await runBrainstorm(engine, config, {
+      question: parsed.question,
+      profile: effectiveProfile,
+      skipCostPreview: skipPreview,
+    });
+  } catch (err) {
+    if (err instanceof StructuredAgentError) {
+      if (parsed.json) {
+        // Agents reading --json get the structured envelope (matches
+        // serializeError shape from src/core/errors.ts).
+        console.log(JSON.stringify({ error: err.envelope }, null, 2));
+      } else {
+        console.error(`Error [${err.envelope.code}]: ${err.envelope.message}`);
+        if (err.envelope.hint) console.error(`  Hint: ${err.envelope.hint}`);
+      }
+      process.exit(1);
+    }
+    throw err; // not our error class — let the dispatcher handle it
+  }
 
   if (parsed.json) {
     console.log(JSON.stringify(result, null, 2));
