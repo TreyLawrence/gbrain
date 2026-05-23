@@ -214,6 +214,19 @@ export async function importFromContent(
      * the version bump.
      */
     forceRechunk?: boolean;
+    /**
+     * v0.38.3.0 provenance write-through (WARN-8). When set, threaded to
+     * `tx.putPage` so the page's `source_kind`, `source_uri`,
+     * `ingested_via` DB columns get populated. The trust gate lives at the
+     * `put_page` op layer — by the time importFromContent sees these, the
+     * caller is already trusted (capture CLI sets them; remote MCP callers
+     * had theirs overridden to `mcp:put_page` upstream). `ingested_at` is
+     * NOT a caller-controllable param; the engine's putPage stamps it
+     * server-side via now() when any provenance write fires.
+     */
+    source_kind?: string | null;
+    source_uri?: string | null;
+    ingested_via?: string | null;
   } = {},
 ): Promise<ImportResult> {
   // v0.18.0+ multi-source: when caller is syncing under a non-default source,
@@ -335,6 +348,14 @@ export async function importFromContent(
       // code can resolve frontmatter-fallback slugs back to their files.
       chunker_version: MARKDOWN_CHUNKER_VERSION,
       source_path: opts.sourcePath ?? null,
+      // v0.38.3.0 provenance write-through (WARN-8). Engine layer applies
+      // COALESCE-preserve UPDATE so omitting these on a later put_page
+      // doesn't erase the original ingestion's audit trail.
+      source_kind: opts.source_kind ?? null,
+      source_uri: opts.source_uri ?? null,
+      ingested_via: opts.ingested_via ?? null,
+      // ingested_at is server-stamped at the engine layer when any
+      // provenance write fires; never client-controlled.
     }, txOpts);
 
     // Tag reconciliation: remove stale, add current

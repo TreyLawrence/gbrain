@@ -538,11 +538,48 @@ const put_page: Operation = {
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
+    // v0.38.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
+    // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
+    // MCP callers (ctx.remote !== false) have their values OVERRIDDEN with
+    // server stamps below; the params are accepted on the wire only so the
+    // op schema stays uniform across transports. Audit-trail spoofing is
+    // closed structurally — clients cannot poison source_kind labels.
+    source_kind: { type: 'string', required: false, description: 'Ingestion channel taxonomy (capture-cli | put_page | webhook | …). Remote callers: SERVER-STAMPED, client value ignored.' },
+    source_uri: { type: 'string', required: false, description: 'Original URI/path/message-id the event carried. Remote callers: SERVER-STAMPED null.' },
+    ingested_via: { type: 'string', required: false, description: 'Richer label paired with source_kind. Remote callers: SERVER-STAMPED.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+
+    // v0.38.3.0 CV6 trust gate for provenance write-through (WARN-8).
+    // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
+    // autopilot, dream cycle, file watcher) may populate source_kind /
+    // source_uri / ingested_via from their own state. Anything else
+    // (HTTP MCP, stdio MCP, subagent) gets the server-stamped
+    // `mcp:put_page` regardless of what was passed.
+    //
+    // Closes the spoofing surface CV6 identified: pre-fix a write-scope
+    // OAuth token could send `source_kind: 'capture-cli'` to poison the
+    // audit trail. Fail-closed: `ctx.remote === false` is the ONLY truthy
+    // condition that admits client-supplied provenance.
+    let provenanceKind: string | null;
+    let provenanceUri: string | null;
+    let provenanceVia: string | null;
+    if (ctx.remote === false) {
+      // Trusted local caller: honor the client params (may be null/undefined
+      // for legacy local callers that don't set them).
+      provenanceKind = (p.source_kind as string | undefined) ?? null;
+      provenanceUri = (p.source_uri as string | undefined) ?? null;
+      provenanceVia = (p.ingested_via as string | undefined) ?? null;
+    } else {
+      // Remote caller or unset trust: server stamps. Mirrors the existing
+      // write-through stamping at the file-side (~:637).
+      provenanceKind = 'mcp:put_page';
+      provenanceUri = null;
+      provenanceVia = 'mcp:put_page';
+    }
 
     // Subagent namespace enforcement (v0.15+). Runs BEFORE the dry-run
     // short-circuit so preview calls surface the same rejection. Confines
@@ -591,6 +628,14 @@ const put_page: Operation = {
     const result = await importFromContent(ctx.engine, slug, p.content as string, {
       noEmbed,
       ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
+      // v0.38.3.0 provenance write-through (WARN-8). Trust-filtered values
+      // computed above; ingested_at is server-stamped at the engine layer.
+      // Null-valued fields signal "no provenance write this call" and the
+      // engine's COALESCE-preserve UPDATE keeps the prior first-write
+      // record intact (CV12 audit-trail survival).
+      source_kind: provenanceKind,
+      source_uri: provenanceUri,
+      ingested_via: provenanceVia,
     });
 
     // v0.38 put_page write-through:
