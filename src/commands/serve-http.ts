@@ -26,7 +26,7 @@ import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
-import { hasScope, ALLOWED_SCOPES_LIST } from '../core/scope.ts';
+import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
@@ -1090,12 +1090,33 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Register client from admin dashboard
   app.post('/admin/api/register-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
     try {
-      const { name, scopes, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
+      // v0.38.3.0 WARN-9 + CV12: accept BOTH `scopes` (admin SPA convention)
+      // AND `scope` (OAuth wire-format convention, singular). The pre-fix
+      // code destructured only `scopes` and used `scopes || 'read'` which:
+      //   - Silently ignored `scope` requests (always defaulted to 'read')
+      //   - Threw on array input because registerClientManual's parseScopeString
+      //     calls .split(' ') which arrays don't have
+      //   - Accepted `['read write']` (space-in-element bug shape codex flagged)
+      //     and other malformed inputs
+      // normalizeScopesInput handles all four valid shapes (string, string[],
+      // missing, empty) and rejects the rest with a structured 400.
+      const { name, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
+      const rawScopes = (req.body as Record<string, unknown>).scopes ?? (req.body as Record<string, unknown>).scope;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      let scopeString: string;
+      try {
+        scopeString = normalizeScopesInput(rawScopes);
+      } catch (e) {
+        res.status(400).json({
+          error: 'invalid_scopes',
+          message: e instanceof Error ? e.message : String(e),
+        });
+        return;
+      }
       const grants = Array.isArray(grantTypes) && grantTypes.length > 0 ? grantTypes : ['client_credentials'];
       const uris = Array.isArray(redirectUris) ? redirectUris : [];
       const result = await oauthProvider.registerClientManual(
-        name, grants, scopes || 'read', uris,
+        name, grants, scopeString, uris,
       );
       // Public client (PKCE-only, no secret): NULL out client_secret_hash and
       // set auth method so the SDK's clientAuth middleware skips the hash-vs-
