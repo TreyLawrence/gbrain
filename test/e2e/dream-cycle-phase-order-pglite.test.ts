@@ -105,6 +105,9 @@ async function withoutAnthropicKey<T>(body: () => Promise<T>): Promise<T> {
 //   v0.29   — added `recompute_emotional_weight` between patterns and embed
 //   v0.31   — added `consolidate` between recompute_emotional_weight and embed
 //   v0.33   — added `resolve_symbol_edges` between extract and patterns
+//   v0.36.1.0 — added propose_takes + grade_takes + calibration_profile
+//   v0.39.0.0 — added `schema-suggest` between orphans and purge
+//   v0.41.0.0 — added `extract_atoms` after extract_facts + `synthesize_concepts` after patterns
 type CyclePhase = (typeof ALL_PHASES)[number];
 const EXPECTED_PHASES: CyclePhase[] = [
   'lint',
@@ -113,8 +116,10 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'synthesize',
   'extract',
   'extract_facts',               // v0.32.2 — reconcile fence → DB facts index
+  'extract_atoms',               // v0.41 — pack-gated; reads transcripts via Haiku
   'resolve_symbol_edges',       // v0.33.3 — within-file symbol resolution
   'patterns',
+  'synthesize_concepts',         // v0.41 — pack-gated; clusters atoms into concepts
   'recompute_emotional_weight', // v0.29
   'consolidate',                // v0.31
   'propose_takes',              // v0.36.1.0 — hindsight calibration wave
@@ -122,6 +127,7 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'calibration_profile',        // v0.36.1.0
   'embed',
   'orphans',
+  'schema-suggest',              // v0.39.0.0
   'purge',                       // v0.26.5
 ];
 
