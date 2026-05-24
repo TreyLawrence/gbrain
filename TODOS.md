@@ -156,6 +156,69 @@ cleanup can move each into the relevant area section.
   doesn't. (Embedding cluster.)
 
 ---
+## v0.40.7.0 Schema Cathedral v3 follow-ups (v0.40.7+)
+
+These were filed when v0.40.7.0 closed PR #1321's design as a production
+rebuild. The wave shipped the 9 MCP ops + 14 CLI verbs + atomic mutation
+primitives + skill on-ramp; three wiring sites were larger than expected
+at plan time and got carved out:
+
+- [ ] **v0.40.7+: enrichment-service.ts union widening (`'person' | 'company'` → `string`).**
+  `src/core/enrichment-service.ts` hard-codes the `entityType` union in 6
+  sites (`:25`, `:48`, `:60`, `:238`, `:246`, + caller mappings). Widening
+  to `string` and threading the active pack's path_prefixes through
+  `slugifyEntity` closes the T1.5 silent-no-op bug for the enrichment
+  pipeline. Estimated 2 hours CC. Third T1.5 wiring site (whoknows +
+  find_experts MCP already wired in v0.40.7.0).
+
+- [ ] **v0.40.7+: facts/eligibility.ts pack-aware ELIGIBLE_TYPES wiring.**
+  `src/core/facts/eligibility.ts:49` defines a hardcoded `ELIGIBLE_TYPES`
+  array. Should consult `extractableTypesFromPack(pack)`. Behavioral
+  change: every brain's extraction surface changes once wired, so needs
+  careful verification.
+
+- [ ] **v0.40.7+: three doctor checks for schema pack health.**
+  `schema_pack_coverage` (warn >10%, fail >30% untyped on non-default
+  pack), `schema_pack_writability` (reads schema-mutations audit JSONL
+  for PACK_READONLY failures), `schema_pack_mutation_audit` (anomalous
+  patterns like >20 mutations/week). All warn-only; reuse
+  `summarizeMutations()` for cross-surface parity. Audit log shipped
+  with the right shape so these drop in cleanly.
+
+- [ ] **v0.40.7+: T16 — hermetic schema-authoring eval gate.**
+  Extend `src/commands/eval-schema-authoring.ts` into a PGLite harness
+  driving detect → suggest → add-type → sync end-to-end on 3 fixtures.
+  Filing-accuracy delta metric (not top-3 hit rate per codex C18). DI
+  seam via `suggestFn`. 3 hours CC + placeholder-name fixtures.
+
+- [ ] **v0.40.7+: T16.1 — separate "suggest top-3 hit rate" eval.**
+  Different question from T16. ~2 hours CC.
+
+- [ ] **v0.41+: T19 — per-source federated read closure across mounts.**
+  Trust gate today rejects divergent-pack federated reads
+  (`op-trust-gate.ts:111-116`). Real fix needs per-source SQL closure
+  via `buildPerSourceBindings`. Document workaround: register
+  source-scoped OAuth clients.
+
+- [ ] **v0.41+: T20 — extends-chain merging in registry.ts.**
+  `registry.ts:167` documents the gap. Implementing full child-wins
+  merge cascades through every consumer of `manifest.page_types`. ~1
+  day CC.
+
+- [ ] **v0.41+: T21 — comment-preserving YAML emitter.**
+  v0.40.7.0 emitter does NOT preserve comments. Authors who care
+  pin pack.json. Replacing with a comment-aware library is the proper
+  fix.
+
+- [ ] **v0.41+: T22 — admin SPA tab for schema verbs.**
+  CLI + MCP only this wave.
+
+- [ ] **v0.41+: T23 — finer-grained `schema:write` OAuth scope.**
+  Today the write ops gate on `admin`. Splitting `admin → admin +
+  schema:write` is a cross-cutting refactor.
+
+- [ ] **v0.41+: T24 — multi-tenant pack federation in a single brain.**
+  One active pack per source remains.
 
 ## v0.40.3.0 follow-ups (v0.41+)
 
@@ -186,7 +249,7 @@ cleanup can move each into the relevant area section.
   `checkSyncFreshness`'s message to include `embedding_coverage_pct` per source
   alongside the staleness number so doctor surfaces the coverage gap inline.
   Implementation: reuse `buildSyncStatusReport` from `src/commands/sync.ts`,
-  fold coverage into the existing per-source message string. ~half a day.
+
 
 ## v0.40.1.0 Track D follow-ups (v0.41+)
 

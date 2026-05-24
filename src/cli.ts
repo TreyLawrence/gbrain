@@ -56,6 +56,10 @@ const CLI_ONLY_SELF_HELP = new Set([
   // the generic short-circuit so the destructive-action warning text
   // reaches the user.
   'reinit-pglite',
+  // v0.40.6.0 Schema Cathedral v3 — `gbrain schema --help` should hit
+  // schema.ts printHelp() with the full 22+ verb taxonomy, not the
+  // generic short-circuit's one-line stub.
+  'schema',
 ]);
 
 async function main() {

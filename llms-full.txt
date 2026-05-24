@@ -694,6 +694,37 @@ Key files:
   (operations.ts:1103-1135 trust-boundary gate); thin-client `think` warns
   loudly when those flags are set.
 
+## Schema Cathedral v3 (v0.40.7.0)
+
+The schema-pack mutation surface shipped in v0.40.7.0 as the production rebuild of
+closed community PR #1321 (`@garrytan-agents`). Six new foundation modules + a
+mutate skeleton + stats/sync data plane + 14 CLI verbs + 9 MCP ops + a first-class
+agent skill. See `~/.claude/plans/system-instruction-you-are-working-recursive-thacker.md`
+for the full plan + 21 captured design decisions.
+
+Key files (v0.40.7.0 additions):
+- `src/core/schema-pack/pack-lock.ts` — Atomic `O_CREAT|O_EXCL` per-pack lock. DELIBERATELY NOT the `existsSync + writeFileSync` TOCTOU shape from `src/core/page-lock.ts` (codex C8 caught the bug class). Default 60s TTL, refresh every 10s while `withPackLock(fn)` runs, `--force` semantics = "steal stale lock" NOT "skip locking." Lock path per-pack so two packs never block each other.
+- `src/core/schema-pack/mutate-audit.ts` — ISO-week JSONL at `~/.gbrain/audit/schema-mutations-YYYY-Www.jsonl`. Privacy-redacted per D20: type names → sha8, prefixes → first slug segment only, matches `candidate-audit.ts` privacy posture. Logs BOTH success AND failure events so the v0.40.7+ `schema_pack_writability` doctor check has signal to read. `summarizeMutations()` is the cross-surface parity primitive.
+- `src/core/schema-pack/registry.ts` extensions — `invalidatePackCache(name?)` walks the extends-chain reverse-graph (codex C6 fix; pre-v0.40.7, editing a parent pack silently left children stale). `tryCachedPack(name)` TTL-gated fast path: inside `STAT_TTL_MS` (default 1000ms, env `GBRAIN_PACK_STAT_TTL_MS`) returns cached without statting. Outside the window: stats every file in the chain; cascade-invalidates on mtime change (D11 cross-process detection).
+- `src/core/schema-pack/best-effort.ts` — `loadActivePackBestEffort(ctx)` returns `ResolvedPack | null`. Single source of truth for the T1.5 wiring sites. `null` means EMPTY FILTER (NOT hardcoded defaults — D4 contract closing the silent-violation bug class).
+- `src/core/schema-pack/lint-rules.ts` — 11 pure rule functions. `withMutation`'s pre-write validation gate composes the 9 file-plane rules; the 2 DB-aware rules (`extractable_empty_corpus`, `mutation_count_anomaly`) need an engine. Single source of truth consumed by CLI lint + MCP `schema_lint` + the pre-write validation gate.
+- `src/core/schema-pack/query-cache-invalidator.ts` — `invalidateQueryCache(engine, sourceId?)` DELETEs query_cache rows so cached search results bound to old page types don't survive a schema mutation. Codex C9 fix.
+- `src/core/schema-pack/mutate.ts` — 8-step `withMutation` skeleton (bundled-guard → lock → read → mutator → validate → atomic write → audit → invalidate). 11 mutation primitives: `addTypeToPack`, `removeTypeFromPack` (with codex C14 reference check), `updateTypeOnPack`, `addAliasToType`, `removeAliasFromType`, `addPrefixToType`, `removePrefixFromType`, `addLinkTypeToPack`, `removeLinkTypeFromPack`, `setExtractableOnType`, `setExpertRoutingOnType`. Atomic write via `.tmp + fsync + rename` — pack file on disk is NEVER partial. Inline minimal JSON→YAML emitter so YAML packs stay YAML (does NOT preserve comments — pin pack.json if you care about layout).
+- `src/core/schema-pack/stats.ts` — `runStatsCore(engine, opts)` returns per-source + aggregate page counts + coverage % + `dead_prefixes` (declared prefixes with zero matching pages — agent's drilldown signal). Multi-source aware (`sourceIds[]` federated, `sourceId` single, or whole-brain). PGLite + Postgres parity via `executeRaw`. Empty brain → coverage:1.0 (vacuous truth).
+- `src/core/schema-pack/sync.ts` — `runSyncCore(engine, opts)` chunked UPDATE in 1000-row batches per declared prefix (D14). Concurrent writers never block on a single row >100ms. Codex C5 write-side scoping via `ctx.sourceId` directly (NOT `sourceScopeOpts` which inherits OAuth read federation). Idempotent on `--apply` re-run.
+- `src/commands/schema.ts` extension — 14 new CLI verbs in the dispatch table: `add-type`, `remove-type`, `update-type`, `add-alias`, `remove-alias`, `add-prefix`, `remove-prefix`, `add-link-type`, `remove-link-type`, `set-extractable`, `set-expert-routing`, `stats`, `sync`, `reload`. `withConnectedEngine` defensive fix from closed PR #1321 retained. Lifecycle-grouped help text (Inspection / Activation / Authoring / Discovery+repair).
+- `src/core/operations.ts` extension — 9 new MCP ops: `get_active_schema_pack`, `list_schema_packs`, `schema_stats`, `schema_lint`, `schema_graph`, `schema_explain_type`, `schema_review_orphans` (all read-scope, NOT localOnly), plus `schema_apply_mutations` (**admin scope, NOT localOnly per D2** so remote agents like your OpenClaw can author packs over HTTPS MCP — batched per D10, one MCP tool taking an `mutations[]` array atomically inside ONE `withPackLock`, audit log captures `actor: mcp:<clientId8>`) and `reload_schema_pack` (admin, NOT localOnly). Trust posture: per-call `schema_pack` opt STAYS rejected for remote callers via `op-trust-gate.ts` (R2 regression preserved).
+- `src/commands/whoknows.ts` + `src/core/operations.ts:find_experts` — T1.5 wiring sites. Pack-aware via `expertTypesFromPack(pack.manifest)` from `best-effort.ts`. Pack-load failure → EMPTY filter (NOT hardcoded `['person', 'company']` defaults per D4). A `researcher` type declared `--expert` now surfaces in `whoknows` results; pre-v0.40.7 it silently never matched.
+- `skills/schema-author/SKILL.md` — Agent dispatcher for "evolve the schema pack." Triggers: 15+ phrasings including "add a page type", "my brain has untyped pages", "propose new types from my corpus", "backfill page types". Explicit Non-goals callout to `brain-taxonomist` (files one page) and `eiirp` (schema-check during iteration) so agents pick the right surface. 7-phase workflow: brain → assess → propose → apply → sync → verify → commit. Lists every gbrain schema CLI verb + every MCP op the skill uses. `brain_first: exempt` frontmatter. Required v0.40.7+ conformance sections: Contract, Anti-Patterns, Output Format.
+- `skills/conventions/schema-evolution.md` — Canonical convention: "when to add a type vs alias vs prefix." Decision tree: <20 pages → don't pack-codify; 20-100 → alias or narrow prefix on existing type; 100+ → first-class type. Don'ts section + "when to remove a type" + "when to commit the pack" all answered in one place.
+- `skills/RESOLVER.md` + `skills/manifest.json` — schema-author wired into the dispatcher with full functional-area trigger list (compressed routing pattern per v0.32.3 dispatcher convention).
+
+T1.5 wiring is partial in v0.40.7.0. Three follow-ups filed in TODOS.md under
+"v0.40.7.0 Schema Cathedral v3 follow-ups (v0.40.7+)" — enrichment-service.ts
+union widening (`'person' | 'company'` → `string`), facts/eligibility.ts
+pack-aware `ELIGIBLE_TYPES` wiring, and 3 doctor checks (schema_pack_coverage,
+schema_pack_writability, schema_pack_mutation_audit).
+
 ## Commands
 
 Run `gbrain --help` or `gbrain --tools-json` for full command reference.
@@ -2450,6 +2481,7 @@ These apply to ALL brain-writing skills:
 - `skills/conventions/quality.md` — citations, back-links, notability gate
 - `skills/conventions/brain-first.md` — check brain before external APIs
 - `skills/conventions/brain-routing.md` — which brain (DB) and which source (repo) to target; cross-brain federation is latent-space only
+- `skills/conventions/schema-evolution.md` — when to add a type vs alias vs prefix (read before `schema-author`)
 - `skills/conventions/subagent-routing.md` — when to use Minions vs inline work
 - `skills/ask-user/SKILL.md` — choice-gate pattern for human input at decision points
 - `skills/_brain-filing-rules.md` — where files go
@@ -2468,6 +2500,7 @@ These apply to ALL brain-writing skills:
 | "verify this academic claim", "check this study", "academic verify", "validate citation", "is this study real" | `skills/academic-verify/SKILL.md` |
 | "make pdf from brain", "brain pdf", "convert brain page to pdf", "publish this page as pdf", "export brain page" | `skills/brain-pdf/SKILL.md` |
 | "voice note", "ingest this voice memo", "transcribe and file", "voice note ingest", "save this audio note" | `skills/voice-note-ingest/SKILL.md` |
+| "add a page type", "add a type to my schema", "schema author", "schema mutate", "schema pack add", "my brain has untyped pages", "propose new types from my corpus", "backfill page types", "evolve my schema", "researcher type", "make X an expert type" (dispatcher for: gbrain schema active/list/show/validate/graph/lint/stats/explain/use/downgrade/reload/init/fork/edit/diff/add-type/remove-type/update-type/add-alias/remove-alias/add-prefix/remove-prefix/add-link-type/remove-link-type/set-extractable/set-expert-routing/detect/suggest/review-candidates/review-orphans/sync) | `skills/schema-author/SKILL.md` |
 
 ---
 
@@ -2488,6 +2521,8 @@ The brain wires itself. Every page write extracts entity references and creates 
 GBrain is those patterns, generalized. Install in 30 minutes. Your agent does the work. As Garry's personal agent gets smarter, so does yours.
 
 **New in v0.40.2.0 — `gbrain think` grounds temporal answers in the typed-claim timeline.** Ask "when did Marco last switch jobs" or "what was the ARR in March" and the answer comes back rooted in a real chronological timeline of the metric + event facts your brain already extracted via the `extract_facts` cycle phase. Default ON. The intent classifier (`temporal` / `knowledge_update` / `other`) is a regex pass with zero LLM cost; the `'other'` fast path short-circuits with zero extra SQL. Migration v82 adds a nullable `facts.event_type` column so the same plumbing carries event-shaped rows (`'meeting'`, `'job_change'`, `'location_change'`) alongside metric rows. Flip `think.trajectory_enabled=false` to opt out. Debug with `GBRAIN_THINK_DEBUG=1 gbrain think "..."` to see the spliced prompt. The same trajectory plumbing also lands in the LongMemEval benchmark with a methodology change disclosed in `methodology_note: extractor=haiku-preprocess-full-haystack-v1` — published scores are "gbrain + Haiku-preprocess pipeline" vs "gbrain alone", NOT directly comparable to baseline LongMemEval numbers without that note.
+
+**New in v0.40.7.0 — Your agents can now author your brain's schema pack themselves.** No more shell-out, no more hand-editing YAML. Tell your OpenClaw (or any agent connected via MCP) "my brain has 4000 untyped meetings pages — add a `meeting` type and backfill them," and it does the whole thing safely: per-pack atomic file lock, validation gate that catches dangling references pre-write, atomic write so a crash never leaves the pack half-written, privacy-redacted audit log with the agent's identity, chunked UPDATE in 1000-row batches that never wedge concurrent writers. 14 new `gbrain schema` CLI verbs (`add-type`, `remove-type`, `add-alias`, `add-link-type`, `stats`, `sync`, etc.) + 9 new MCP ops including the batched `schema_apply_mutations` (admin scope, NOT localOnly — remote agents reach it over normal HTTPS MCP). New `schema-author` skill with explicit boundary callouts to `brain-taxonomist` and `eiirp` so agents pick the right surface. The schema-pack cathedral that shipped in v0.39.1.0 is now reachable from the outside. **Why it matters:** [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — 7 killer use cases (4000 invisible meetings made queryable, the founder ops brain, the research brain, the legal brain, the team brain, agent-as-co-curator) plus the structural difference between a pile of notes and a brain with structure. **Walkthrough:** [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md) — fork the bundled pack, add a `researcher` type, backfill, query in 5 minutes.
 
 **New in v0.36.4.0 — Your agent drives the brain to 90/100 by itself.** One command does the loop you used to run by hand: `gbrain doctor --remediate --yes --target-score 90 --max-usd 5`. It computes a dependency-ordered plan (sync before extract, embed after consolidate), submits each step as a Minion job, re-checks score between every step, and refuses to spend past your cost cap. Cron can drive it unattended. `gbrain doctor --remediation-plan --json` previews what would run. Autopilot now does the same thing on its 5-minute tick: small problems get targeted handlers, big problems get the full cycle, a healthy brain sleeps for 60 minutes instead of grinding through synthesize+patterns+embed every tick. Eleven new things you can submit as background jobs (`reindex`, `repair-jsonb`, `orphans`, `integrity`, `purge`, plus six cycle phases); three of them (synthesize, patterns, consolidate) are PROTECTED so an MCP-connected agent can't silently burn Anthropic credits. New `--background` flag on `gbrain embed` submits the job and exits with `job_id=N` for shell composition.
 
@@ -2603,6 +2638,8 @@ The whole loop is described in [`docs/architecture/topologies.md`](docs/architec
 
 **Brain consistency.** `gbrain eval suspected-contradictions` samples retrieval pairs, layered date pre-filter, query-conditioned LLM judge, persistent cache. Surfaces conflicts between takes + facts the agent has written. Wired into the daily dream cycle.
 
+**Agent-authored schema (v0.40.7.0).** Your brain has a shape — what page types exist (`person`, `meeting`, `paper`, `case`, `lab-result`), what they link to (`attended`, `authored`, `prescribed-by`), what facts get extracted automatically. The default ships with 22 universal types, but your brain's actual shape is not the default shape. Agents can now evolve that shape on your behalf via 14 `gbrain schema` CLI verbs + a batched MCP op (`schema_apply_mutations`, admin scope, NOT localOnly so remote agents reach it over HTTPS). Atomic file locks, audit log with the agent's identity, chunked UPDATE backfill in 1000-row batches that never wedge concurrent writers. The brain stops being a pile of notes and becomes something with structure. **Why it matters:** [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator). **5-minute walkthrough:** [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md). **Agent skill:** [`skills/schema-author/SKILL.md`](skills/schema-author/SKILL.md).
+
 ## Integrations
 
 Data flowing into the brain. Each integration is a recipe — markdown + setup hints — that ships in `recipes/` and is discoverable via `gbrain integrations list`.
@@ -2630,6 +2667,8 @@ Data flowing into the brain. Each integration is a recipe — markdown + setup h
 ## Docs
 
 - [`docs/INSTALL.md`](docs/INSTALL.md) — every install path, end to end
+- [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — why schemas matter: 7 killer use cases, the structural argument for typed page kinds, the agent-co-curates pattern (v0.40.7.0)
+- [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md) — 5-minute walkthrough: fork the bundled pack, add a custom type, backfill existing pages, prove the wiring via `gbrain whoknows`
 - [`docs/architecture/`](docs/architecture/) — system design, topologies, retrieval theory
 - [`docs/guides/`](docs/guides/) — how-to runbooks (sub-agent routing, minion deployment, skill development, brain-first lookup, idea capture, diligence ingestion)
 - [`docs/integrations/`](docs/integrations/) — connecting external data sources (voice, email, calendar, embedding providers)
@@ -2899,6 +2938,421 @@ Every method in `BrainEngine`. The full interface. No optional methods, no featu
 **Custom/Remote.** The interface is clean enough that someone could build an engine backed by any storage: Firestore, DynamoDB, a REST API, even a flat file system. The interface doesn't assume SQL.
 
 Note: The original SQLite engine plan (`docs/SQLITE_ENGINE.md`) was superseded by PGLite. PGLite uses the same SQL as Postgres, eliminating the need for a separate SQLite dialect with FTS5/sqlite-vss translation.
+
+---
+
+## docs/what-schemas-unlock.md
+
+Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/what-schemas-unlock.md
+
+# What schemas unlock
+
+Most note-taking apps treat every page the same. You write something, it goes in a pile, you search the pile with text matching. Tags help, but tags are flat. After a few thousand pages, the pile gets noisy and the search gets stupid.
+
+Schemas are how gbrain stops being a pile of notes and becomes something with structure. A schema declares what KINDS of things live in your brain (`person`, `company`, `meeting`, `researcher`, `case`, `lab-result`), what they link to (`attended`, `authored`, `prescribed-by`), what facts the system should extract automatically (`mrr=50000`, `damages=5000000`), and which types route through expert search vs general search.
+
+The default schema (`gbrain-base`) ships with 22 page types covering the universal shapes — people, companies, meetings, notes, daily, calendar events. That's enough to start. But your brain is yours, and your brain's shape is not the default shape. A research brain needs `researcher` and `paper` as first-class types. A founder brain needs `lead`, `investor`, `portco`, `deal-stage`. A lawyer brain needs `case`, `motion`, `deposition`, `precedent`. Same engine, totally different shape.
+
+v0.40.7.0 made it possible for AGENTS to author that shape for you. Not just "the user manually edits YAML in `~/.gbrain/schema-packs/mine/pack.yaml`" but "your agent sees the corpus, proposes a type, asks for approval, applies it atomically with a full audit trail, then backfills 4000 existing pages with one chunked SQL command." That's the new thing.
+
+This doc is the WHY. The [tutorial](schema-author-tutorial.md) is the HOW.
+
+## Killer use cases
+
+### 1. The 4000 invisible pages
+
+You have 4000 markdown files under `meetings/` going back two years. The default schema doesn't have a `meeting` type, so all 4000 are typed `note` (the catchall). When you run:
+
+```bash
+gbrain whoknows "Q3 roadmap discussion"
+```
+
+You get the top 10 text matches, ranked by raw relevance. The brain has no idea these are meetings. It can't route to attendees. It can't pull dates. It can't surface "this conversation came up again with the same people three weeks later."
+
+Add a `meeting` type:
+
+```bash
+gbrain schema add-type meeting --primitive temporal --prefix meetings/ --extractable
+gbrain schema sync --apply
+```
+
+The sync backfills `page.type = 'meeting'` on all 4000 pages in 1000-row batches. Now:
+
+- `gbrain whoknows "Q3 roadmap discussion"` routes through the meeting type, ranking by `expert_routing` signal (attendees, recency, salience) instead of raw text.
+- `gbrain extract-facts` runs on every meeting page automatically (because `extractable: true`), pulling typed facts like `attended_by=alice-example`, `date=2026-05-23`.
+- The downstream `think` skill can now answer "what did we decide about pricing in the last three roadmap meetings" by querying the meeting graph instead of grep'ing 4000 files.
+
+One command. 4000 pages went from invisible to queryable. The content didn't change. The structure did.
+
+### 2. The founder ops brain
+
+You're a founder or investor with ~500 markdown files mixing leads, portfolio companies, deal notes, intros, and follow-ups. You've been writing freely; you have no system. Your queries are all "wait, who introduced me to that fintech founder again?" and you scroll Notion for 20 minutes.
+
+Add the founder shape:
+
+```bash
+gbrain schema fork gbrain-base mine
+gbrain schema use mine
+
+# Types
+gbrain schema add-type lead       --primitive entity --prefix people/leads/         --expert
+gbrain schema add-type investor   --primitive entity --prefix people/investors/     --expert --extractable
+gbrain schema add-type portco     --primitive entity --prefix companies/portco/     --expert --extractable
+gbrain schema add-type deal       --primitive entity --prefix companies/deals/      --extractable
+
+# Link verbs
+gbrain schema add-link-type invested-in --page-type investor --target-type portco
+gbrain schema add-link-type intro-from  --page-type lead     --target-type lead
+gbrain schema add-link-type passed-on   --page-type investor --target-type deal
+gbrain schema add-link-type led-by      --page-type deal     --target-type investor
+
+gbrain schema sync --apply
+```
+
+Now `gbrain whoknows "Series A SaaS"` routes through `investor` and `portco` types specifically, not the noisy general type set. `gbrain graph-query alice-example --type intro-from --depth 2` walks two hops of intros to surface "Alice introduced you to Bob who introduced you to Charlie." `gbrain extract-facts` starts producing typed claims from the fence in your deal pages: `(deals/acme-seed, raise=2000000, valuation=15000000, lead=widget-vc, closed_at=2026-05-23)`.
+
+The CRM you've been promising yourself you'll set up next quarter? You just shipped it in 4 commands. It's downstream of your notes, not parallel to them.
+
+### 3. The research brain
+
+Replace "founder" with "PhD student" and the same pattern applies with different types: `researcher`, `paper`, `lab`, `grant`, `dataset` + `authored`, `cites`, `funded-by`, `uses-dataset`.
+
+```bash
+gbrain schema add-type paper --primitive annotation --prefix research/papers/ --extractable
+gbrain schema add-link-type authored   --page-type researcher --target-type paper
+gbrain schema add-link-type cites      --page-type paper      --target-type paper
+gbrain schema add-link-type uses       --page-type paper      --target-type dataset
+```
+
+Suddenly "show me papers that cite this work AND use the same dataset" is a `gbrain graph-query` traversal, not 30 minutes in Google Scholar. The fact extraction picks up `arxiv_id=2402.04253`, `cited_by_count=140`, `published_date=2026-02-15` automatically. Your reading-list-as-markdown turns into a queryable research graph that knows who works on what and what's connected to what.
+
+### 4. The legal brain (or any domain where claims have numbers)
+
+Lawyers, medical providers, accountants, anyone working in a domain where the meaning of a number depends on its type. A "judgment of $5M" against a "$2M case strategy threshold" is a comparison the brain can do — but only if both numbers are typed.
+
+```bash
+gbrain schema add-type case --primitive entity --prefix legal/cases/ --extractable --expert
+gbrain schema add-type motion --primitive annotation --prefix legal/motions/ --extractable
+gbrain schema add-type deposition --primitive annotation --prefix legal/depositions/ --extractable
+gbrain schema add-link-type filed-in --page-type motion --target-type case
+gbrain schema add-link-type cites    --page-type motion --target-type precedent
+```
+
+Now `## Facts` fences in your case notes can carry typed claims (`damages=5000000`, `filed_date=2026-05-23`, `judge=jane-doe`) that gbrain stores as first-class columns. `gbrain eval trajectory legal/cases/acme-v-widget` prints the case history with regressions flagged. `gbrain founder scorecard` (renamed for legal: roll up plaintiff success rate, average damages, settlement-vs-trial ratio) gives you a structured view of how your practice is performing.
+
+This isn't possible without typed page kinds. You can write the same prose in any note-taking app. Only gbrain treats the numbers as comparable across pages of the same type.
+
+### 5. The team brain
+
+`gbrain mounts add` lets you stack additional brains alongside your personal one. Each mounted brain has its OWN schema pack. The eng team's brain has `incident`, `runbook`, `service`, `oncall-rotation`. The design team's brain has `component`, `experiment`, `ab-test`, `figma-link`. The legal team's brain has cases and depositions.
+
+When you query, the schema pack governs how each source's content is routed. An eng query against the mounted eng brain knows that `incidents/2026-05-23-db-outage.md` is an `incident` page with `severity=p0`, `mttr=47min`, `on_call=alice-example` — extractable typed facts. Your personal query against the same brain still works, but the routing is sharper because the eng team has invested in their ontology.
+
+The schema is the team's tribal knowledge made explicit. Two engineers on different teams searching the same brain get DIFFERENT routing because their personal packs declare different expert types.
+
+### 6. The "agent co-curates your ontology" pattern (the new thing)
+
+This is what v0.40.7.0 actually enabled, and what the closed PR #1321 was reaching for.
+
+Your OpenClaw (or any agent connected to your brain over HTTPS MCP with admin scope) watches your ingestion stream. After a week of you dumping notes under `garrytan/companies/yc-w24/`, the agent runs `gbrain schema detect` periodically, sees that prefix accumulating, and proposes:
+
+> You have 47 pages under `companies/yc-w24/` typed as `company` (generic). They share a structural pattern (founder names, raise amounts, batch tag). Should I add a `yc-w24-company` type with `extractable: true` and the existing aliases pointing back to `company`? I'd backfill the 47 pages and add `cohort=W24` as a typed fact extracted from each page.
+
+You approve once. The agent calls `schema_apply_mutations` over MCP with a batch:
+
+```json
+{
+  "pack": "mine",
+  "mutations": [
+    {"op": "add_type", "name": "yc-w24-company", "primitive": "entity", "prefix": "companies/yc-w24/", "extractable": true, "expert_routing": true},
+    {"op": "add_alias", "type": "yc-w24-company", "alias": "company"}
+  ]
+}
+```
+
+All inside ONE `withPackLock` scope, atomic, audited (the agent's `client_id` captured in the audit log as `actor: mcp:<clientId8>`). Cache invalidated cross-process. Sync backfills the 47 pages. The brain learned a new category of thing without you having to think about it.
+
+The next time you query "YC W24 companies in fintech", the brain routes through the new type. Six months later when you forget the pattern entirely, the agent reminds you it's there and offers to consolidate it with the W25 batch.
+
+The brain learns. The agent is the curator. You approve, the agent does the work.
+
+### 7. The before-vs-after benchmark
+
+If you want to FEEL the difference without buying the pitch:
+
+Pick a real corpus you have. Run `gbrain whoknows` on a topic that should match. Note the top-3 results.
+
+Then run `gbrain schema review-orphans --limit 50 --json` and look at the untyped pages. If 10+ of them share an obvious prefix that should be a real type, add the type + sync.
+
+Re-run the same `whoknows` query. Top-3 should shift, because the new type is now routing through expert ranking instead of being lumped into the catchall. The numerical delta IS the win. You can run a tutorial in 5 minutes; this experiment proves it matters on your actual content.
+
+## Why this matters
+
+Three things gbrain does that generic note systems can't:
+
+**1. The brain knows the difference between a person and an idea.** Page-type matters at query time. `gbrain whoknows` only considers `expert_routing: true` types. `gbrain extract-facts` only runs on `extractable: true` types. `gbrain graph-query` walks declared link verbs. None of that works on a flat tag system because tags don't have semantics — they're labels. Types are first-class citizens with rules attached.
+
+**2. Untyped content is invisible content.** If your meetings are typed as `note`, expert routing skips them, facts extraction ignores them, link inference doesn't fire. They exist on disk and they're indexed for text search, but the structural surfaces (whoknows, find_experts, recall, think) treat them as second-class. Adding a type isn't cosmetic; it's structural promotion.
+
+**3. The schema is queryable AND mutable AND auditable.** You can ask the brain what its schema looks like (`gbrain schema graph`), evolve it through 14 atomic CLI verbs + 9 MCP ops with full lock + audit semantics, and recover from any mistake (every primitive has an inverse, plus `gbrain schema downgrade` restores the previous active pack). This isn't "vibes-based knowledge management." It's a production system with structural integrity guarantees.
+
+## What changed in v0.40.7.0 specifically
+
+v0.39.1.0 shipped the schema-pack engine. You could ALREADY fork the bundled pack and edit `pack.yaml` by hand. What you couldn't do was let an agent author it safely — there were no atomic file locks, no audit log, no MCP exposure, no pack-aware wiring in the query path. The cathedral was built but unreachable from the outside.
+
+v0.40.7.0 closed those gaps:
+
+- **`withMutation` skeleton** wraps every primitive in 8 ordered safety steps (bundled-guard → lock → read → mutate → validate → atomic write → audit → invalidate). The pack file on disk is never partial. Two concurrent agents can't race.
+- **Per-pack `O_CREAT|O_EXCL` atomic lock** (not the TOCTOU `existsSync+writeFileSync` pattern from page-lock.ts — codex caught that during plan review). TTL refresh every 10s while a mutation runs; `--force` means "steal stale lock" not "skip locking."
+- **Privacy-redacted audit log** at `~/.gbrain/audit/schema-mutations-YYYY-Www.jsonl`. Type names sha8-hashed, prefixes truncated to first segment only. A leaked screenshot of the audit can't reveal sensitive taxonomy like `personal/oncology/` or `legal/depositions/`.
+- **9 new MCP ops** including the batched `schema_apply_mutations` (admin scope, NOT localOnly — your OpenClaw and any remote agent author packs over normal HTTPS MCP, with `client_id` captured as `actor: mcp:<clientId8>`).
+- **T1.5 wiring** finally completes for `whoknows` and `find_experts`: a custom `researcher` type marked `--expert` now actually surfaces in query results. Pre-v0.40.7 it silently never matched because the query path read hardcoded `['person', 'company']`.
+- **Cross-process invalidation** via stat-mtime TTL gate inside `loadActivePack`. Operator runs `gbrain schema add-type` from a terminal; the autopilot daemon picks up the new type within 1 second without a restart.
+
+The cumulative effect: an agent can safely co-curate your ontology with a complete forensic trail. That's the new thing.
+
+## Where to start
+
+- **Want to see it work in 5 minutes?** Run the [tutorial](schema-author-tutorial.md). Forks the bundled pack, adds a researcher type, proves the wiring end-to-end.
+- **Want the agent recipe?** Read [`skills/schema-author/SKILL.md`](../skills/schema-author/SKILL.md). 7-phase workflow agents follow when they detect a schema-evolution opportunity.
+- **Want the rules of thumb?** Read [`skills/conventions/schema-evolution.md`](../skills/conventions/schema-evolution.md). Decision tree for when to add a type vs alias vs prefix. <20 pages don't pack-codify. 100+ pages need first-class types.
+- **Want the architecture?** The "Schema Cathedral v3 (v0.40.7.0)" section in `CLAUDE.md` has the 14-bullet module-by-module breakdown, each citing the design decision and codex finding that motivated it.
+- **Want to set up an agent that co-curates your brain?** Run `gbrain auth register-client my-agent --scopes admin` to mint an OAuth client your remote agent can use to call `schema_apply_mutations` over MCP. The agent then runs detect → suggest → apply on its own cadence and asks you to approve substantive changes.
+
+The killer feature isn't "schemas." Personal knowledge systems have had schemas forever. The killer feature is that your AGENT can shape them safely on your behalf, with structural integrity guarantees that match what you'd expect from a database, not a notes app.
+
+That's what we built. Try it on a corpus you actually have and the numbers go up.
+
+---
+
+## docs/schema-author-tutorial.md
+
+Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/schema-author-tutorial.md
+
+# Tutorial: Build your first schema pack
+
+You'll fork the bundled `gbrain-base` pack, add a custom `researcher` page type, import a handful of placeholder researcher pages, backfill their `page.type` column with one command, then prove the wiring works by running `gbrain whoknows` and seeing your new type surface in results. End state: a forked-and-active pack on disk, ~5 pages typed as `researcher`, and a query that proves the pack-aware routing fires end-to-end.
+
+**Want the WHY before the HOW?** Read [`what-schemas-unlock.md`](what-schemas-unlock.md) first — 7 concrete use cases (4000 invisible meetings, the founder ops brain, the research brain, the legal brain, the team brain, agent-as-co-curator) plus the structural argument for why types matter at query time. Then come back here for the 5-minute walkthrough.
+
+The whole walkthrough takes about 5 minutes. You'll see something working by step 3.
+
+## What you'll need
+
+- gbrain v0.40.7.0 or later (`gbrain --version` to check)
+- A brain that's been initialized (`gbrain init` already run; either PGLite or Postgres is fine)
+- A terminal you can paste commands into
+
+That's it. No API keys required for this tutorial — every step works against the bundled pack and local-only commands.
+
+## Step 1: See what pack is active today
+
+```bash
+gbrain schema active --json
+```
+
+You'll see something like:
+
+```json
+{
+  "pack_name": "gbrain-base",
+  "version": "1.0.0",
+  "sha8": "...",
+  "page_types_count": 22,
+  "source_tier": "default"
+}
+```
+
+`source_tier: "default"` means you haven't customized anything — you're on the bundled pack. `page_types_count: 22` is the universal starter (person, company, meeting, note, etc.).
+
+**You can't mutate bundled packs directly.** Step 2 forks it so you have something writable.
+
+## Step 2: Fork the bundled pack
+
+```bash
+gbrain schema fork gbrain-base mine
+```
+
+Output: `Forked 'gbrain-base' → 'mine' at ~/.gbrain/schema-packs/mine/pack.json`.
+
+The fork is a byte-for-byte copy of `gbrain-base` living at `~/.gbrain/schema-packs/mine/pack.json`. Now you have a writable pack you can mutate.
+
+## Step 3: Activate the fork
+
+```bash
+gbrain schema use mine
+```
+
+Output: `Pack: mine (json) ... Active.`
+
+Run `gbrain schema active --json` again to confirm `pack_name` is now `mine` and `source_tier` is `home-config` (read from `~/.gbrain/config.json`).
+
+**You've already accomplished something visible** — the active pack changed, and any future query will route through your fork. The next four steps add a custom type and prove it works.
+
+## Step 4: Add a researcher type
+
+```bash
+gbrain schema add-type researcher \
+  --primitive entity \
+  --prefix people/researchers/ \
+  --extractable \
+  --expert
+```
+
+Output: `Pack: mine (json)` + `Sha8: <prev> → <new>`.
+
+What just happened:
+- The mutation went through `withMutation`'s 8-step skeleton: bundled-guard → per-pack lock → read → mutate → file-plane lint validation → atomic write → audit log → cache invalidation.
+- The pack now declares `researcher` as an entity primitive bound to `people/researchers/`, marked `extractable: true` (eligible for facts extraction) and `expert_routing: true` (surfaces in `whoknows` queries).
+- An audit row landed in `~/.gbrain/audit/schema-mutations-YYYY-Www.jsonl` with your type name SHA-8-redacted and the prefix's first segment only (`people`) for privacy.
+
+Verify the type is in the pack:
+
+```bash
+gbrain schema explain researcher
+```
+
+You'll see the resolved settings printed back.
+
+## Step 5: Import some placeholder researcher pages
+
+You need pages under `people/researchers/` for the next step to do anything. If your brain repo already has them, skip ahead. If not, drop 3-5 placeholder markdown files into `<your-brain-repo>/people/researchers/` and import:
+
+```bash
+mkdir -p people/researchers
+cat > people/researchers/alice-example.md <<'EOF'
+---
+title: Alice Example
+---
+
+ML researcher at Example Lab. Works on contrastive embeddings.
+EOF
+
+cat > people/researchers/bob-example.md <<'EOF'
+---
+title: Bob Example
+---
+
+Vision researcher at Widget University. Recent paper on diffusion models.
+EOF
+
+cat > people/researchers/charlie-example.md <<'EOF'
+---
+title: Charlie Example
+---
+
+RL researcher at Acme Research. Focus on inverse reinforcement learning.
+EOF
+
+gbrain sync
+```
+
+The sync imports the new files. They'll be stored in the database but their `type` column will still be empty — the new type was added to the pack AFTER these pages already existed (the typical real-world scenario for an agent walking into an existing brain).
+
+## Step 6: See the gap with `stats`
+
+```bash
+gbrain schema stats --json | jq '.aggregate, .dead_prefixes'
+```
+
+You'll see `untyped_pages: 3` (or however many you just imported) and `dead_prefixes: []` — your new prefix has 3 matching pages, so it's not dead.
+
+The 3 researcher pages are "orphaned" by type even though they live in the right directory. The next step backfills them.
+
+## Step 7: Backfill with `sync --apply`
+
+First dry-run to see what would happen:
+
+```bash
+gbrain schema sync --json
+```
+
+You'll see something like:
+
+```json
+{
+  "schema_version": 1,
+  "apply": false,
+  "per_prefix": [
+    {
+      "type": "researcher",
+      "prefix": "people/researchers/",
+      "would_apply": 3,
+      "sample_slugs": ["people/researchers/alice-example", "people/researchers/bob-example", "people/researchers/charlie-example"],
+      "applied": 0
+    }
+  ],
+  "total_would_apply": 3,
+  "total_applied": 0
+}
+```
+
+`would_apply: 3` is what you'd touch. `sample_slugs` is the agent's drilldown signal — if those slugs look wrong, abort. They look right, so apply:
+
+```bash
+gbrain schema sync --apply
+```
+
+You'll see per-batch progress lines on stderr and a final `total_applied: 3`. The UPDATE ran in chunks of 1000 (yours fit in one chunk) and never wedged any concurrent writer.
+
+## Step 8: Prove the wiring works
+
+```bash
+gbrain whoknows "machine learning"
+```
+
+If your researcher pages contain ML-related content, they'll surface in the ranked results — even though they're typed `researcher`, not `person` or `company`.
+
+**This is the load-bearing demonstration of T1.5 wiring.** Pre-v0.40.7.0, `whoknows` hardcoded `['person', 'company']` as the eligible types and would have ignored your `researcher` pages entirely. The v0.40.7.0 wiring consults the active pack's `expert_routing: true` types via `expertTypesFromPack(pack.manifest)`, so your custom type now routes through expert search.
+
+## What you built
+
+You now have:
+- A fork of `gbrain-base` named `mine` at `~/.gbrain/schema-packs/mine/pack.json`, active in your brain via `~/.gbrain/config.json`.
+- A `researcher` page type registered in the pack with `entity` primitive, `people/researchers/` prefix, `extractable: true`, `expert_routing: true`.
+- 3 pages typed as `researcher` (backfilled from disk via `gbrain schema sync --apply`).
+- A query path that routes through the new type: `gbrain whoknows` reads the pack and includes `researcher` in its type filter.
+
+You also exercised the full mutation skeleton: bundled-pack guard, per-pack lock, validation gate, atomic write, audit log, cache invalidation. Every step was idempotent — re-running any of them is a no-op.
+
+## Next steps
+
+**Add a link verb.** A `researcher` can `author` a `paper`. To model that:
+
+```bash
+gbrain schema add-type paper --primitive annotation --prefix research/papers/ --extractable
+gbrain schema add-link-type authored --page-type researcher --target-type paper
+gbrain schema graph
+```
+
+The graph now shows `researcher --(authored)--> paper`.
+
+**Add aliases for query closure.** If you want `gbrain query researcher` to also surface `person` rows (because researchers ARE people):
+
+```bash
+gbrain schema add-alias researcher person
+```
+
+Read [`skills/conventions/schema-evolution.md`](../skills/conventions/schema-evolution.md) for the decision tree on when to add types vs aliases vs prefixes. The short version: <20 pages → don't pack-codify; 20-100 → alias on existing type; 100+ → first-class type.
+
+**Lint your pack before shipping.** The 11-rule lint surface (with the optional `--with-db` flag for DB-aware checks) catches dangling references, prefix collisions, and dead-corpus warnings:
+
+```bash
+gbrain schema lint --with-db
+```
+
+**Commit your pack to source control.** If `~/.gbrain/schema-packs/mine/` is a git repo, commit `pack.json` and push. Your pack survives across machines, and the `mutation_count_anomaly` lint rule will nudge you when you hit >50 mutations in a week (the "you should be committing this" signal).
+
+**For agents (MCP):** the same operations are reachable over HTTPS MCP via 9 new ops. Register an admin-scope OAuth client and `schema_apply_mutations` lets a remote agent compose multi-step refactors as one atomic batch. The batched MCP op + per-pack lock + audit log are the load-bearing primitives that make remote schema authoring safe. See [`skills/schema-author/SKILL.md`](../skills/schema-author/SKILL.md) for the agent dispatcher.
+
+**Undo a mistake.** Every mutation primitive has an inverse (`remove-type`, `remove-alias`, `remove-prefix`, `remove-link-type`, `set-extractable false`, etc.). If you fork twice and want to revert, `gbrain schema downgrade` restores the previous active pack from `~/.gbrain/schema-pack-history.jsonl`.
+
+## Related docs
+
+- **Reference:** `gbrain schema --help` for the full 22-verb CLI surface; CLAUDE.md's "Schema Cathedral v3 (v0.40.7.0)" section for the module-by-module architecture.
+- **How-to:** [`skills/schema-author/SKILL.md`](../skills/schema-author/SKILL.md) — the agent dispatcher with the 7-phase workflow (brain → assess → propose → apply → sync → verify → commit).
+- **Explanation:** [`skills/conventions/schema-evolution.md`](../skills/conventions/schema-evolution.md) — when to add a type vs alias vs prefix.
+- **Plan + decisions:** the original design captured 21 decisions including the bundled-pack guard rationale (D6), the empty-filter fallback contract (D4), and the MCP non-localOnly trust posture (D2). Lives in `~/.claude/plans/system-instruction-you-are-working-recursive-thacker.md` (private).
 
 ---
 

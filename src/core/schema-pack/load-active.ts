@@ -31,6 +31,7 @@ import { loadPackFromFile } from './loader.ts';
 import {
   resolveActivePackName,
   resolvePack,
+  tryCachedPack,
   UnknownPackError,
   type ResolvedPack,
   type ResolutionInput,
@@ -143,8 +144,17 @@ async function loadPackManifestByName(name: string): Promise<SchemaPackManifest>
 export async function loadActivePack(input: LoadActivePackInput): Promise<ResolvedPack> {
   const resolutionInput = buildResolutionInput(input);
   const resolution: ResolutionResult = resolveActivePackName(resolutionInput);
+  // v0.40.6.0: TTL-gated cache fast path. Inside STAT_TTL_MS (default 1s)
+  // returns immediately (~10ns). Outside the window: stats files in the
+  // extends chain; cascade-invalidates and falls through on mtime change.
+  const cached = tryCachedPack(resolution.pack_name);
+  if (cached) return cached;
   const manifest = await loadPackManifestByName(resolution.pack_name);
-  return await resolvePack(manifest, loadPackManifestByName);
+  // Thread the locator so resolvePack can snapshot file paths + mtimes
+  // for the stat-TTL gate on subsequent calls (codex C6 + D11 + D13).
+  return await resolvePack(manifest, loadPackManifestByName, {
+    loadByPath: (name) => _packLocator(name),
+  });
 }
 
 /**
