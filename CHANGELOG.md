@@ -2,6 +2,118 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.10.0] - 2026-05-25
+
+**CI got twice as fast. Every PR now finishes in about four and a half
+minutes instead of nine, so you get back to writing code instead of
+watching a spinner.**
+
+If you've ever pushed a change and watched the GitHub Actions "Test"
+check creep along at 9 minutes, that's because one giant test file was
+single-handedly setting the floor for every shard. We pulled that file
+apart, gave the heaviest pieces their own dedicated CI runners, doubled
+the matrix shard count, and added a cache for the install step. Result:
+CI wallclock drops from ~9 min to ~4.5 min. Your inner loop just got
+shorter.
+
+What you can now do:
+
+- **Push a PR and have CI green up in under five minutes.** The matrix
+  is the floor (about 4.5 min); the two slow files run in parallel in
+  their own jobs (3.3 min and 2.6 min). Nothing waits on a 6-minute
+  single-file atom anymore.
+- **If you write benchmarks against gbrain's `runEvalLongMemEval`, you
+  can share one PGLite engine across many calls.** New optional
+  `engine` field on `RunOpts` lets test suites create one in-memory
+  brain in `beforeAll` and thread it through every benchmark invocation
+  instead of paying the 1-3 second PGLite cold-create cost per call.
+  Production CLI behavior is unchanged when you don't pass the field.
+
+What you should watch for after upgrading:
+
+- The CI matrix is now 10 shards (was 6), plus two dedicated single-file
+  jobs (`slow-eval-longmemeval`, `slow-entity-resolve-perf`). With two
+  concurrent PRs you're at 36 queued jobs against GitHub's free-tier
+  ~20-job ceiling, so multi-PR days may see some queue pressure.
+  Single-PR runs are unaffected.
+- The new benchmark `engine` opt is additive. Existing callers that
+  don't pass it keep getting their own fresh PGLite per
+  `runEvalLongMemEval` call.
+
+## To take advantage of v0.41.10.0
+
+There's nothing to migrate for end users — this is a CI-infrastructure
+release that improves your test feedback loop. After upgrade:
+
+1. **Push a PR and watch the CI duration.** Expected wallclock is ~4.5
+   minutes, down from ~9. If a particular shard takes much longer than
+   the others, file the file name + your CI run URL and we'll re-mine
+   `scripts/test-weights.json` to rebalance.
+2. **If you maintain benchmarks against `gbrain/runEvalLongMemEval`,
+   consider opting into engine sharing.** Create the engine once via
+   `createBenchmarkBrain()` in `beforeAll`, pass it as `{ engine }` to
+   every `runEvalLongMemEval` call, and disconnect in `afterAll`. Cuts
+   benchmark wallclock substantially when you have many invocations in
+   one file.
+
+### Itemized changes
+
+- **`src/commands/eval-longmemeval.ts`** — `RunOpts.engine?: PGLiteEngine`
+  added. When set, `runEvalLongMemEval` uses the caller's engine and
+  skips the `withBenchmarkBrain` create+disconnect wrapper. The
+  caller owns lifecycle. `runOneQuestion` already calls `resetTables()`
+  as its first line, so per-question state isolation is preserved
+  across the shared engine. Production CLI unchanged: when `opts.engine`
+  is undefined, the existing `withBenchmarkBrain` path runs as before.
+
+- **`test/eval-longmemeval.slow.test.ts`** — trimmed from 884 lines to
+  374. Keeps the 8 pure / harness-only describes (15 tests): harness
+  lifecycle, resetTables, schema-migration robustness, warm-create speed
+  gate, adapter `haystackToPages`, source-boost regression guard,
+  `loadResumeSet`, `buildByTypeSummary`. Local wallclock ~2 seconds.
+
+- **`test/eval-longmemeval-e2e.slow.test.ts`** (NEW, 503 lines, 11 tests)
+  — receives the 8 e2e describes (every describe that calls
+  `runEvalLongMemEval`). Creates one shared `PGLiteEngine` in
+  `beforeAll`, threads it through all 13 `runEvalLongMemEval` calls via
+  the new `engine` opt, disconnects in `afterAll`. Local wallclock 9.3
+  seconds, was 15.1 seconds without engine sharing (38% reduction).
+  Projected CI: 196 seconds, was 317 seconds.
+
+- **`test/helpers/longmemeval-stub.ts`** (NEW, 56 lines) — extracted
+  `makeStubClient` + `StubCall` interface. Single source of truth across
+  the split test files; matches the existing `test/helpers/` convention
+  (`with-env.ts`, `reset-pglite.ts`).
+
+- **`.github/workflows/test.yml`** — matrix shard count bumped 6 → 10
+  (per-shard total drops from 532s to 272s). Two new dedicated jobs
+  `slow-eval-longmemeval` and `slow-entity-resolve-perf` run their files
+  in parallel with the matrix. `actions/cache@v4.2.3` added to every job
+  that runs `bun install` (matrix, verify, serial-tests, both slow-file
+  jobs); cache key based on `bun.lock` hash. Both new jobs wired into
+  `cache-write.needs` and `test-status.needs` so CI gates on them.
+
+- **`scripts/test-shard.sh`** — `find ... -not -name` clauses added for
+  the two dedicated-job files so the matrix sweep doesn't double-run
+  them.
+
+- **`scripts/test-weights.json`** — `test/eval-longmemeval.slow.test.ts`
+  weight split from 359087 ms into 42000 ms (pure half) + 196000 ms
+  (e2e half). Projected from local wall-clock × CI scaling factor; first
+  post-merge CI run will refine via `scripts/mine-shard-weights.ts`.
+
+### For contributors
+
+This wave shipped via a `/plan-eng-review` + `/codex` consult cycle that
+caught two load-bearing mistakes mid-flight: (1) the initial bucket
+split misclassified three describes that were calling
+`runEvalLongMemEval` — caught by Codex's `grep` audit of the actual
+file. (2) The original "split alone shrinks CI" premise was wrong —
+caught by running the shard simulator on real weights, which showed all
+LPT-balanced shards still totaled 532s. The honest mid-flight pivot to
+"split + dedicated job + matrix bump" delivered the actual wallclock
+savings.
+
 ## [0.41.9.0] - 2026-05-25
 
 **Five UX/reliability fixes from a single production incident report. Your
