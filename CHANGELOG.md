@@ -115,6 +115,45 @@ Promise calibration: design doc #1409 originally framed this as "88% orphans →
 - TODO-4 P1: Post-merge measurement on a representative brain; update #1409 design doc with the measured orphan-ratio delta.
 
 Co-authored credit: `@garrytan-agents` for surfacing both the surrogate-pair fix and the orphan-reduction design across PRs #1378-#1382 (now closed in favor of consolidated design doc #1409).
+## [0.41.7.0] - 2026-05-24
+
+**Your compact OpenClaw resolver actually works now.** If you've grown your agent past 200 skills and switched to the compact list-format resolver (`- **gift-advisor**: gift idea | birthday gift`) because the markdown-table version got unreadable, `gbrain doctor` used to silently report every single skill as unreachable. On a 306-skill agent, that was 238 FAIL errors on every doctor run, and the list-format resolver was effectively invisible to gbrain. v0.41.7.0 fixes that — the parser now reads both shapes natively, mixes them in one file, and `gbrain doctor` reports 0 errors on the same resolver that previously broke it.
+
+This release ships alongside a new guide explaining when and why you actually want a list-format resolver: the [three-tier scaling architecture](docs/guides/scaling-skills.md) that gets a 300-skill agent down to ~4K tokens per turn (from ~25K) with zero capability loss. The parser fix is the line of code that makes the resolver-as-router tier work for any agent that writes the compact format.
+
+### How to take advantage of v0.41.7.0
+
+`gbrain upgrade`. The parser handles both formats automatically; no migration needed. The tutorial at [`docs/guides/scaling-skills.md`](docs/guides/scaling-skills.md) explains when and why to tier your skills.
+
+### What you'd see (before vs after)
+
+On a real 306-skill agent with a list-format `RESOLVER.md`:
+
+| `gbrain doctor` output | Before v0.41.7.0 | After v0.41.7.0 |
+|---|---|---|
+| `resolver_health` status | FAIL | OK |
+| `unreachable` skills | 238 | 0 |
+| Per-skill error noise | every skill named | none |
+
+### Things to watch
+
+- **Skill names in list format must be kebab-lowercase** (`gift-advisor`, `flight-tracker`). Bold names that start with an uppercase letter (`**MyTool**`) are silently skipped by the new parser. This is the trade that kills the prose-bullet false-positive class (`- **Note**: see [link]` in a real AGENTS.md no longer gets parsed as a skill row). If a skill stops appearing after upgrade, lowercase the name.
+- **The path suffix is parsed but stripped.** A list entry like `- **quality**: lint -> \`skills/conventions/quality.md\`` produces `skills/quality/SKILL.md` (derived from the name), NOT the explicit path. Two downstream consumers (`routing-eval.ts` and the manifest check) assume the `skills/<name>/SKILL.md` shape; honoring the explicit path would silently break their coverage. For non-conventional skill paths, use the table format (which has always supported them).
+- **Mixed table + list in one file works.** The v0.31.7 multi-resolver merge (skillpack `skills/RESOLVER.md` + workspace `../AGENTS.md`) folds both shapes into one unified entry stream, deduped by skillPath.
+
+### Itemized changes
+
+- New: `src/core/check-resolvable.ts` `parseResolverEntries` accepts compact list-format resolvers alongside the existing table format. Both shapes can mix in one file. The list-branch contract is documented inline.
+- New: `test/check-resolvable-openclaw-compact.test.ts` regression suite (8 cases across two fixtures) pinning the "238 FAILs → 0" headline outcome plus the D-CX-14 mixed-merge case.
+- New: `test/fixtures/openclaw-compact-resolver/` (~10 skills with valid frontmatter triggers, plus a prose-bullet section pinning the kebab-lowercase regex tighten).
+- New: `test/fixtures/openclaw-mixed-merge/` (table-format `skills/RESOLVER.md` + compact `../AGENTS.md`).
+- New: `docs/guides/scaling-skills.md` — walkthrough of the three-tier scaling architecture (always-loaded, resolver-routed, dormant), the per-turn token math, and the compact list-format spec. Registered in `scripts/llms-config.ts` so `bun run build:llms` regenerates `llms-full.txt` correctly.
+- Extended: `test/check-resolvable.test.ts` — 11 new unit cases covering bold-name single + multi-trigger fan-out, plain-name fallback, Unicode and ASCII path-suffix strip, ellipsis filter, empty pipe segments, mixed shapes, section tracking across list entries, and two D4-regression cases (prose-bullet rejection + convention-violation negative).
+- Credit `@garrytan-agents` for the original PR #1370 submission that flagged the parser gap. The v0.41.7.0 implementation expands the scope to close the prose-bullet false-positive class (`[a-z][a-z0-9-]+` name regex), pin the regression at the integration layer (two fixtures), and ship the docs context (the scaling-skills guide).
+
+### For contributors
+
+- Codex outside-voice review surfaced four findings the eng review missed: the upstream PR's literal "add list branch below" instruction would have produced dead code (the existing `continue` short-circuits non-table rows before any list branch would fire); the explicit-path-suffix capture would have broken `routing-eval.ts:skillSlugFromPath` + the manifest check at `check-resolvable.ts:367`; the `docs/guides/scaling-skills.md` doc needed registration in `scripts/llms-config.ts` for `test/build-llms.test.ts` to pass; and the original em-dash cleanup instruction would have corrupted command flags like `--pglite`. All four caught and integrated pre-merge.
 ## [0.41.6.0] - 2026-05-25
 
 **Your PR CI stops taking 23 minutes.** The Test workflow on every pull request was wallclock-bound by one unlucky shard (shard 3, 22-26 min) while other shards finished in 5-13 min. After this release, every shard finishes in roughly the same time, the whole matrix runs in about 9-10 min on a fresh PR, and PRs that don't actually change test-affecting code (rebases, doc-only commits, retries) skip the test run entirely and finish in under 2 minutes via a content-hash cache.
@@ -707,6 +746,7 @@ What we caught and fixed before merging. Three independent reviews + three codex
    ```
 5. **If any step fails or the numbers look wrong,** please file an issue:
    https://github.com/garrytan/gbrain/issues with `gbrain doctor --json` output.
+
 ## [0.40.10.0] - 2026-05-24
 
 **Your brain stops accepting junk pages, and oversize content stops crashing the embedder.** A page from one of your source repos can no longer break embedding, defeat search, or pollute your knowledge graph just because it's a Cloudflare challenge dump or an absurdly large file. The new sanity gate lives at the narrow waist of ingestion, so every path that writes pages — sync, capture, `put_page` MCP, the `/ingest` webhook — picks it up uniformly.

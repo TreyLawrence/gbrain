@@ -152,6 +152,49 @@ note. Filing it as a TODO would imply it's ready to pull; it isn't.
   current behavior (truncate-then-fail) is safe — no infinite loops,
   depth-cap prevents chains — but full semantic reduction unlocks higher
   self-fix success rates on legitimately-long prompts.
+## v0.41.7.0 resolver-parser follow-ups (filed during ship of `garrytan/pr1370-production-ready`)
+
+Source: Codex outside-voice review on the PR #1370 production-rebuild plan.
+The wave shipped with the primary parser fix + 11 unit tests + 2 integration
+fixtures + scaling-skills tutorial. Two findings deferred:
+
+- [ ] **F8 P3 — Path-traversal hardening for the existing table-format
+  parser.** Both the existing table parser and the new list parser accept
+  inputs like `skills/../x/SKILL.md`; downstream `join(skillsDir, relPath)`
+  can escape `skillsDir`. The v0.41.7.0 list branch is structurally closed
+  (the kebab-lowercase `[a-z][a-z0-9-]+` name regex rejects `.` in names so
+  `..` is blocked at the name layer). The table branch surface is
+  pre-existing and out of scope for v0.41.7.0. Move: at the file-existence
+  check in `src/core/check-resolvable.ts` (around line 352), add a
+  `relPath.split('/').includes('..')` guard that surfaces as an
+  `unreachable` issue with a "path traversal not allowed" message. Low
+  severity: requires malicious/buggy RESOLVER.md content to fire.
+
+- [ ] **F9 P3 — Document the fan-out/dedup interaction in the resolver
+  guide.** `checkResolvable` dedupes by `skillPath`, so the v0.41.7.0
+  list-format multi-trigger fan-out (`- **foo**: t1 | t2 | t3` produces 3
+  entries) doesn't change the integration reachability count. This is
+  desired behavior (one skill counted once) but surprising for readers who
+  count parser entries. Move: add a one-paragraph "how fan-out interacts
+  with reachability" note to `docs/guides/scaling-skills.md` after we have
+  reader feedback indicating the confusion is real. Codex noted that unit
+  tests prove parser output, integration tests prove reachability, and the
+  current docs don't bridge the two cleanly. Doc-only follow-up.
+
+- [ ] **P1 flake — audit-writer.test.ts week-boundary failure.** Caught
+  during ship of v0.41.7.0. Test at `test/audit/audit-writer.test.ts:229`
+  ("returns events from current week, filtered by ts cutoff") fails when
+  real UTC date is in a different ISO week than the test's hardcoded
+  `now=2026-05-22`. `writer.log()` uses real `new Date()` to pick the
+  week-file; `readRecent(now)` uses the fake `now`. When the two land in
+  different ISO weeks (specifically: any time the real UTC clock is in
+  the week AFTER 2026-W21), `log()` writes to the wrong file and
+  readRecent finds 0 events. Fires deterministically once a week, at the
+  UTC Monday rollover. Move: refactor `createAuditWriter.log()` to accept
+  an optional injected `now` (or read it from the entry's own `ts` field).
+  Affected surface: `src/core/audit/audit-writer.ts`. Pre-existing on
+  master; not caused by this branch's parser changes. Reproducible by
+  setting system clock to any Monday after the test's `2026-05-22` date.
 
 ## v0.41 content-sanity follow-ups (filed during ship of `garrytan/lint-page-size-gate`)
 

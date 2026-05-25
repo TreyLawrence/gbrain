@@ -120,6 +120,12 @@ export const SECTIONS: DocSection[] = [
         path: "docs/guides/quiet-hours.md",
       },
       {
+        title: "docs/guides/scaling-skills.md",
+        description:
+          "Three-tier architecture for agents with 300+ skills: always-loaded, resolver-routed, and dormant. Per-turn token math, the v0.41.7.0 compact list-format resolver, and the `gbrain doctor` safety net. 306 skills, ~21K tokens freed per turn, zero capability loss.",
+        path: "docs/guides/scaling-skills.md",
+      },
+      {
         title: "docs/mcp/DEPLOY.md",
         description: "MCP server deployment.",
         path: "docs/mcp/DEPLOY.md",
@@ -176,6 +182,12 @@ export const SECTIONS: DocSection[] = [
         description:
           "Patches for downstream agent skill forks. One section per release.",
         path: "docs/UPGRADING_DOWNSTREAM_AGENTS.md",
+        // Excluded from inlined bundle (v0.41.7.0): 25KB of release-by-release
+        // migration patches that are valuable as a reference but don't need
+        // to ride along in every llms-full.txt fetch. Pushes the bundle back
+        // under FULL_SIZE_BUDGET after the v0.41.7.0 scaling-skills guide
+        // landed.
+        includeInFull: false,
       },
       {
         title: "skills/migrations/",
