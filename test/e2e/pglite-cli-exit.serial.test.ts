@@ -1,5 +1,5 @@
 /**
- * v0.41.6.0 — IRON-RULE regression for #1247, #1269, #1290.
+ * v0.41.8.0 — IRON-RULE regression for #1247, #1269, #1290.
  *
  * Pre-fix: `gbrain search`, `gbrain query`, `gbrain get` on PGLite
  * printed results then hung at ~95-98% CPU until SIGKILL.
@@ -13,7 +13,7 @@
  *
  * Bonus assertion: `gbrain serve --http` (a daemon) MUST stay alive
  * after the first request — the narrow force-exit guard added in
- * v0.41.6.0 is supposed to fire ONLY on op-dispatch drain timeout,
+ * v0.41.8.0 is supposed to fire ONLY on op-dispatch drain timeout,
  * NEVER for daemons. This catches any future regression where the
  * force-exit gets broadened or the guard mis-recognizes 'serve'.
  *
@@ -145,7 +145,7 @@ afterAll(() => {
 
 /**
  * Spawn the CLI with a wall-clock timeout. Returns exit code + output.
- * Without the v0.41.6.0 fix, the subprocess hangs forever and the
+ * Without the v0.41.8.0 fix, the subprocess hangs forever and the
  * timeout would force-kill. The IRON-RULE assertion is "exit code 0
  * within timeoutMs."
  */
@@ -173,7 +173,7 @@ function runWithTimeout(
   });
 }
 
-describe('v0.41.6.0 — PGLite CLI read commands exit cleanly (#1247/#1269/#1290)', () => {
+describe('v0.41.8.0 — PGLite CLI read commands exit cleanly (#1247/#1269/#1290)', () => {
   test('gbrain search "foxtrot" exits 0 within 15s', async () => {
     const { code, stdout, stderr, durationMs } = await runWithTimeout(
       ['search', 'foxtrot', '--limit', '3'],
@@ -227,7 +227,7 @@ describe('v0.41.6.0 — PGLite CLI read commands exit cleanly (#1247/#1269/#1290
   }, 30_000);
 });
 
-describe('v0.41.6.0 — daemon survival (regression guard for narrow force-exit)', () => {
+describe('v0.41.8.0 — daemon survival (regression guard for narrow force-exit)', () => {
   test('gbrain serve --http stays alive past the timeout window', async () => {
     // Pick a likely-free ephemeral port. We're testing "still alive
     // 3 seconds after startup" — if the force-exit guard misfired

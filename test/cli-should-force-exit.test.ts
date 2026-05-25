@@ -1,5 +1,5 @@
 /**
- * v0.41.6.0 — shouldForceExitAfterMain argv parsing unit tests.
+ * v0.41.8.0 — shouldForceExitAfterMain argv parsing unit tests.
  *
  * The function is the safety guard that protects daemons from the
  * narrow timeout-only force-exit in cli.ts. If it misclassifies

@@ -503,6 +503,13 @@ export function classifyErrorCode(errorMsg: string): string {
   }
   if (/TAKES_HOLDER_INVALID/i.test(errorMsg)) return 'TAKES_HOLDER_INVALID';
 
+  // v0.41 content-sanity gate. Hard-blocks at importFromContent throw
+  // ContentSanityBlockError whose toString() embeds `PAGE_JUNK_PATTERN:`
+  // (see src/core/content-sanity.ts PAGE_JUNK_PATTERN_CODE). Soft-blocks
+  // (oversize alone) don't fail — the page lands with frontmatter.embed_skip
+  // set and never enters this classifier.
+  if (/PAGE_JUNK_PATTERN/i.test(errorMsg)) return 'PAGE_JUNK_PATTERN';
+
   return 'UNKNOWN';
 }
 

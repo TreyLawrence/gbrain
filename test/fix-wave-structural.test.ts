@@ -107,7 +107,7 @@ describe('v0.36.1.x #1124 — query --no-expand actually negates expand', () => 
   });
 });
 
-describe('v0.41.6.0 #1247/#1269/#1290 — drain last-retrieved before CLI disconnect', () => {
+describe('v0.41.8.0 #1247/#1269/#1290 — drain last-retrieved before CLI disconnect', () => {
   test('cli.ts imports awaitPendingLastRetrievedWrites', () => {
     const src = readFileSync('src/cli.ts', 'utf8');
     expect(src).toMatch(/import\s+\{\s*awaitPendingLastRetrievedWrites\s*\}\s*from\s+['"]\.\/core\/last-retrieved\.ts['"]/);
@@ -160,7 +160,7 @@ describe('v0.41.6.0 #1247/#1269/#1290 — drain last-retrieved before CLI discon
   });
 });
 
-describe('v0.41.6.0 #1340 — PGLite WASM init classifier', () => {
+describe('v0.41.8.0 #1340 — PGLite WASM init classifier', () => {
   test('pglite-engine.ts exports classifyPgliteInitError + buildPgliteInitErrorMessage', () => {
     const src = readFileSync('src/core/pglite-engine.ts', 'utf8');
     expect(src).toMatch(/export function classifyPgliteInitError/);

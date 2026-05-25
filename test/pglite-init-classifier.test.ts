@@ -1,5 +1,5 @@
 /**
- * v0.41.6.0 (#1340) — PGLite init-error classifier + hint routing.
+ * v0.41.8.0 (#1340) — PGLite init-error classifier + hint routing.
  *
  * Pure-function tests over the classifier + message builder. No
  * PGLite cold-start required. The classifier sits in front of the

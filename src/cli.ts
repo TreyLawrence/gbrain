@@ -182,7 +182,7 @@ async function main() {
 
   // Local engine path (unchanged behavior for local installs).
   const engine = await connectEngine();
-  // v0.41.6.0 (#1247, #1269, #1290): the search / query / get_page
+  // v0.41.8.0 (#1247, #1269, #1290): the search / query / get_page
   // op handlers fire-and-forget `bumpLastRetrievedAt` after returning
   // results. On PGLite that IIFE keeps Bun's event loop alive past
   // engine.disconnect(), hanging the CLI at ~95-98% CPU until SIGKILL.
@@ -1134,7 +1134,16 @@ async function handleCliOnly(command: string, args: string[]) {
     switch (command) {
       case 'import': {
         const { runImport } = await import('./commands/import.ts');
-        await runImport(engine, args);
+        // v0.41 (Codex r2 #3 fix): honor errors counter for exit code.
+        // runImport's per-file catch already records failures, but the
+        // CLI was discarding the result so the process exited 0 even
+        // when files failed (e.g. content-sanity hard-block throws,
+        // size-cap throws, parse errors). Surface non-zero on errors > 0
+        // so wrappers (sync, CI scripts, `&& gbrain doctor`) propagate.
+        const importResult = await runImport(engine, args);
+        if (importResult.errors > 0) {
+          process.exitCode = 1;
+        }
         break;
       }
       case 'export': {

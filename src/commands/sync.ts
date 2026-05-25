@@ -538,7 +538,7 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
 }
 
 async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
-  // v0.41.6.0 (D9 / #1342): phase breadcrumbs. The #1342 reporter saw
+  // v0.41.8.0 (D9 / #1342): phase breadcrumbs. The #1342 reporter saw
   // ZERO stderr output before their sync hang, which made the bug
   // impossible to triage. Mirror the existing `[gbrain phase] sync.git_pull`
   // pattern at the major phase boundaries so the next #1342-shaped

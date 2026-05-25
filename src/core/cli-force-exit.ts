@@ -1,5 +1,5 @@
 /**
- * v0.41.6.0 — narrow force-exit gate for the cli.ts op-dispatch finally.
+ * v0.41.8.0 — narrow force-exit gate for the cli.ts op-dispatch finally.
  *
  * The cli.ts caller fires `process.exit(0)` ONLY when:
  *   1. The op-dispatch drain timed out (drainResult.outcome === 'timeout')

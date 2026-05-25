@@ -1,7 +1,7 @@
 /**
- * v0.41.6.0 — PGLiteEngine.disconnect() lifecycle regression tests.
+ * v0.41.8.0 — PGLiteEngine.disconnect() lifecycle regression tests.
  *
- * Pins the invariants the v0.41.6.0 hang fix wave depends on:
+ * Pins the invariants the v0.41.8.0 hang fix wave depends on:
  *
  *   1. ORDERING: `db.close()` is called BEFORE the file lock is
  *      released. A sibling process must not be able to acquire the
@@ -41,7 +41,7 @@ function newTempDataDir(): string {
   return mkdtempSync(join(tmpdir(), 'gbrain-disconnect-test-'));
 }
 
-describe('PGLiteEngine.disconnect() — v0.41.6.0 lifecycle invariants', () => {
+describe('PGLiteEngine.disconnect() — v0.41.8.0 lifecycle invariants', () => {
   test('ORDERING: db.close() is called BEFORE releaseLock()', async () => {
     const dataDir = newTempDataDir();
     try {

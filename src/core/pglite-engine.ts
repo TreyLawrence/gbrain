@@ -128,7 +128,7 @@ export function computeSnapshotSchemaHash(
 }
 
 /**
- * v0.41.6.0 (#1340) — classify PGLite.create() init failures so
+ * v0.41.8.0 (#1340) — classify PGLite.create() init failures so
  * the user-visible hint points at the right next step.
  *
  * `bunfs` — Bun's vfs ENOENT on older macOS where `/$$bunfs/root`
@@ -234,7 +234,7 @@ export class PGLiteEngine implements BrainEngine {
         extensions: { vector, pg_trgm },
       });
     } catch (err) {
-      // v0.13.1: any PGLite.create() failure becomes actionable. v0.41.6.0
+      // v0.13.1: any PGLite.create() failure becomes actionable. v0.41.8.0
       // (#1340): the previous error hint hardcoded the macOS 26.3 link, but
       // the same crash shape can come from Bun's vfs (`/$$bunfs/root` is
       // read-only on older macOS + Bun 1.3.x, so PGLite can't extract its
@@ -254,7 +254,7 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async disconnect(): Promise<void> {
-    // v0.41.6.0: snapshot + early-null up front so a concurrent
+    // v0.41.8.0: snapshot + early-null up front so a concurrent
     // `connect()` cannot observe `_db` pointing at a handle that's
     // mid-close (partial-state race). Closes the bug class PR #1337
     // originally surfaced.
@@ -311,7 +311,7 @@ export class PGLiteEngine implements BrainEngine {
 
     const { applied } = await runMigrations(this);
     if (applied > 0) {
-      console.log(`  ${applied} migration(s) applied`);
+      process.stderr.write(`  ${applied} migration(s) applied\n`);
     }
   }
 
@@ -537,7 +537,7 @@ export class PGLiteEngine implements BrainEngine {
         && !needsPagesProvenance
         && !needsContextualRetrievalColumns && !needsPagesGeneration) return;
 
-    console.log('  Pre-v0.21 brain detected, applying forward-reference bootstrap');
+    process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
     if (needsPagesBootstrap) {
       // Mirror schema-embedded.ts shape for `sources` so the subsequent
@@ -1922,11 +1922,16 @@ export class PGLiteEngine implements BrainEngine {
 
   async countStaleChunks(opts?: { sourceId?: string }): Promise<number> {
     // D7: source-scoped count for `gbrain embed --stale --source X`.
+    // v0.41 (D4+D8+Codex r2 #11): always JOIN pages so embed-skip filter
+    // applies via `NOT (frontmatter ? 'embed_skip')`. PGLite is
+    // PostgreSQL 17.5 in WASM and supports the full JSONB operator set.
     if (opts?.sourceId === undefined) {
       const { rows } = await this.db.query(
         `SELECT count(*)::int AS count
-           FROM content_chunks
-          WHERE embedding IS NULL`,
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+          WHERE cc.embedding IS NULL
+            AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
       );
       const count = (rows[0] as { count: number } | undefined)?.count ?? 0;
       return Number(count);
@@ -1936,7 +1941,8 @@ export class PGLiteEngine implements BrainEngine {
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
         WHERE cc.embedding IS NULL
-          AND p.source_id = $1`,
+          AND p.source_id = $1
+          AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
       [opts.sourceId],
     );
     const count = (rows[0] as { count: number } | undefined)?.count ?? 0;
@@ -1954,6 +1960,8 @@ export class PGLiteEngine implements BrainEngine {
     const afterIdx = opts?.afterChunkIndex ?? -1;
     // D7: optional source-scoped cursor scan. PGLite mirrors postgres-engine
     // so the engine-parity E2E catches drift.
+    // v0.41 (D4+D8): NOT (frontmatter ? 'embed_skip') filter for soft-blocked
+    // pages, matching the postgres-engine sibling.
     if (opts?.sourceId === undefined) {
       const { rows } = await this.db.query(
         `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
@@ -1961,6 +1969,7 @@ export class PGLiteEngine implements BrainEngine {
            FROM content_chunks cc
            JOIN pages p ON p.id = cc.page_id
           WHERE cc.embedding IS NULL
+            AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
             AND (cc.page_id, cc.chunk_index) > ($1, $2)
           ORDER BY cc.page_id, cc.chunk_index
           LIMIT $3`,
@@ -1975,6 +1984,7 @@ export class PGLiteEngine implements BrainEngine {
          JOIN pages p ON p.id = cc.page_id
         WHERE cc.embedding IS NULL
           AND p.source_id = $1
+          AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
           AND (cc.page_id, cc.chunk_index) > ($2, $3)
         ORDER BY cc.page_id, cc.chunk_index
         LIMIT $4`,

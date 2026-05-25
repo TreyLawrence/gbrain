@@ -40,7 +40,7 @@ let _trackRetrievalCache: { ts: number; enabled: boolean } | null = null;
 const TRACK_RETRIEVAL_CACHE_TTL_MS = 30_000;
 
 /**
- * v0.41.6.0 — fire-and-forget tracking + bounded drain.
+ * v0.41.8.0 — fire-and-forget tracking + bounded drain.
  *
  * Issues #1247, #1269, #1290: PGLite CLI commands printed search /
  * query / get_page output then hung at ~95-98% CPU until SIGKILL.

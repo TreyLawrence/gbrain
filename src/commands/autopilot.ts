@@ -645,6 +645,36 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
       }
     }
 
+    // 4.5 — Nightly quality probe (v0.41).
+    // Per D10: trust the phase's internal 24h rate-limit (via shouldRunNightly
+    // reading the audit JSONL). No scheduler-side precheck — one source of
+    // truth for the rate-limit. Feature flag gates the probe entirely.
+    // Wrapped in try/catch — a probe failure NEVER crashes the autopilot
+    // loop. Probe runs even when cycleOk=false (probe may surface signal
+    // explaining why the cycle is failing).
+    try {
+      const probeEnabled = cfg?.autopilot?.nightly_quality_probe?.enabled === true;
+      if (probeEnabled) {
+        const { runNightlyQualityProbe } = await import('../core/cycle/nightly-quality-probe.ts');
+        const { runLongMemEvalForProbe, runCrossModalBatchForProbe } = await import('../core/cycle/nightly-probe-adapters.ts');
+        const { isAvailable } = await import('../core/ai/gateway.ts');
+        const maxUsd = Number(cfg?.autopilot?.nightly_quality_probe?.max_usd ?? 5);
+        await runNightlyQualityProbe({
+          isEnabled: () => true, // already gated above; phase re-checks for defense-in-depth
+          hasEmbeddingProvider: () => isAvailable('embedding'),
+          resolveMaxUsd: () => maxUsd,
+          resolveRepoRoot: () => repoPath ?? gbrainHomePath('.'),
+          runLongMemEval: runLongMemEvalForProbe,
+          runCrossModalBatch: runCrossModalBatchForProbe,
+          now: () => new Date(),
+        });
+      }
+    } catch (e) {
+      logError('autopilot.nightly_probe', e);
+      // Intentional: do NOT bump consecutiveErrors. Probe failure is
+      // informational; autopilot loop continues.
+    }
+
     // Wait for next cycle
     await new Promise(r => setTimeout(r, interval * 1000));
   }

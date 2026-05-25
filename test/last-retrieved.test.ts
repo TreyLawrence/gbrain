@@ -1,5 +1,5 @@
 /**
- * v0.41.6.0 — drain helper for fire-and-forget last_retrieved_at writes.
+ * v0.41.8.0 — drain helper for fire-and-forget last_retrieved_at writes.
  *
  * Closes #1247, #1269, #1290: PGLite CLI commands printed search /
  * query / get_page output then hung at ~95-98% CPU until SIGKILL.
