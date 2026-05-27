@@ -642,38 +642,9 @@ CREATE TABLE IF NOT EXISTS op_checkpoints (
 CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
   ON op_checkpoints (updated_at);
 
--- ============================================================
--- migration_impact_log: before/after metric stats per onboard remediation
--- ============================================================
--- v0.41.18.0 (gbrain onboard wave). Every completion captured by the
--- onboard remediation pipeline records before/after metric stats so
--- `gbrain onboard --history --json` can show "you reduced orphans 47%".
--- delta computed at read time (NOT a stored GENERATED column —
--- zero PGLite parity risk per eng-review D2).
---
--- Attribution columns (job_id, source_id, brain_id, started_at,
--- idempotency_key) per codex finding #10 so concurrent onboard /
--- autopilot / manual runs can't misattribute deltas to the wrong
--- migration when overlapping runs change the same metric.
-CREATE TABLE IF NOT EXISTS migration_impact_log (
-  id              BIGSERIAL PRIMARY KEY,
-  remediation_id  TEXT      NOT NULL,
-  metric_name     TEXT      NOT NULL,
-  metric_before   NUMERIC,
-  metric_after    NUMERIC,
-  job_id          BIGINT    REFERENCES minion_jobs(id) ON DELETE SET NULL,
-  source_id       TEXT,
-  brain_id        TEXT,
-  started_at      TIMESTAMPTZ,
-  idempotency_key TEXT,
-  applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  applied_by      TEXT,
-  details         JSONB     DEFAULT '{}'::jsonb
-);
-CREATE INDEX IF NOT EXISTS migration_impact_log_remediation_idx
-  ON migration_impact_log(remediation_id, applied_at DESC);
-CREATE INDEX IF NOT EXISTS migration_impact_log_attribution_idx
-  ON migration_impact_log(job_id, source_id) WHERE job_id IS NOT NULL;
+-- migration_impact_log moved BELOW minion_jobs (was here, lines 645-676)
+-- because its `job_id BIGINT REFERENCES minion_jobs(id)` FK requires
+-- minion_jobs to exist FIRST during SCHEMA_SQL replay. v0.41.25.0 fix.
 
 -- ============================================================
 -- files: binary attachments stored in Supabase Storage
@@ -862,6 +833,50 @@ CREATE TABLE IF NOT EXISTS minion_attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_minion_attachments_job ON minion_attachments (job_id);
 ALTER TABLE minion_attachments ALTER COLUMN content SET STORAGE EXTERNAL;
+
+-- ============================================================
+-- migration_impact_log: before/after metric stats per onboard remediation
+-- ============================================================
+-- v0.41.18.0 (gbrain onboard wave). Every completion captured by the
+-- onboard remediation pipeline records before/after metric stats so
+-- `gbrain onboard --history --json` can show "you reduced orphans 47%".
+-- delta computed at read time (NOT a stored GENERATED column —
+-- zero PGLite parity risk per eng-review D2).
+--
+-- Attribution columns (job_id, source_id, brain_id, started_at,
+-- idempotency_key) per codex finding #10 so concurrent onboard /
+-- autopilot / manual runs can't misattribute deltas to the wrong
+-- migration when overlapping runs change the same metric.
+--
+-- v0.41.25.0 SCHEMA_SQL ordering fix: this block lives AFTER the
+-- minion_jobs CREATE TABLE so the `job_id REFERENCES minion_jobs(id)`
+-- FK can resolve on fresh-install schema replay. Originally placed above
+-- minion_jobs in v0.41.18.0; that fired ERROR: relation "minion_jobs"
+-- does not exist on every fresh-install initSchema() (silent on master
+-- because postgres-js's unsafe() continued past the error, but the
+-- table never got created so any later query on migration_impact_log
+-- threw 42P01 — which cascaded as "relation minion_jobs does not exist"
+-- whenever subsequent statements that referenced minion_jobs ran AFTER
+-- the failed CREATE TABLE statement, aborting the entire SCHEMA_SQL batch).
+CREATE TABLE IF NOT EXISTS migration_impact_log (
+  id              BIGSERIAL PRIMARY KEY,
+  remediation_id  TEXT      NOT NULL,
+  metric_name     TEXT      NOT NULL,
+  metric_before   NUMERIC,
+  metric_after    NUMERIC,
+  job_id          BIGINT    REFERENCES minion_jobs(id) ON DELETE SET NULL,
+  source_id       TEXT,
+  brain_id        TEXT,
+  started_at      TIMESTAMPTZ,
+  idempotency_key TEXT,
+  applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  applied_by      TEXT,
+  details         JSONB     DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS migration_impact_log_remediation_idx
+  ON migration_impact_log(remediation_id, applied_at DESC);
+CREATE INDEX IF NOT EXISTS migration_impact_log_attribution_idx
+  ON migration_impact_log(job_id, source_id) WHERE job_id IS NOT NULL;
 
 -- ============================================================
 -- Subagent runtime (v0.16.0) — durable LLM loops
