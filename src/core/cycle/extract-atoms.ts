@@ -48,6 +48,8 @@ import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { GBrainConfig } from '../config.ts';
 import { chat as gatewayChat } from '../ai/gateway.ts';
+import { writeReceipt } from '../extract/receipt-writer.ts';
+import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 
@@ -434,6 +436,38 @@ export async function runPhaseExtractAtoms(
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  // v0.42 Wave B2: write extract receipt + rollup row when the phase
+  // actually extracted atoms. Both are best-effort per F-OUT-19 —
+  // audit-trail / search-visibility surfaces don't block the phase result.
+  if (!opts.dryRun && totalAtomsExtracted > 0) {
+    const runId = `atoms-${Date.now().toString(36)}-${sourceId.slice(0, 4)}`;
+    try {
+      await writeReceipt(engine, {
+        kind: 'atoms',
+        source_id: sourceId,
+        run_id: runId,
+        round: 'single',
+        extracted_at: new Date().toISOString(),
+        total_rows: totalAtomsExtracted,
+        cost_usd: estimatedSpendUsd,
+        summary:
+          `Extracted ${totalAtomsExtracted} atoms from ` +
+          `${transcriptsProcessed} transcripts + ${pagesProcessed} pages.`,
+      });
+    } catch (err) {
+      console.error(`[extract_atoms] receipt write failed: ${(err as Error).message}`);
+    }
+  }
+  if (!opts.dryRun) {
+    await upsertExtractRollup(engine, {
+      kind: 'atoms',
+      source_id: sourceId,
+      cost_delta: estimatedSpendUsd,
+      round_completed_delta: failures.length === 0 ? 1 : 0,
+      halt_delta: failures.length > 0 ? 1 : 0,
+    });
   }
 
   return {

@@ -20,6 +20,8 @@
 
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult } from '../cycle.ts';
+import { writeReceipt } from '../extract/receipt-writer.ts';
+import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { chat as gatewayChat } from '../ai/gateway.ts';
 
 const DEFAULT_BUDGET_USD = 1.5;
@@ -200,6 +202,40 @@ export async function runPhaseSynthesizeConcepts(
     conceptsWritten++;
 
     if (opts.yieldDuringPhase) await opts.yieldDuringPhase();
+  }
+
+  // v0.42 Wave B3: receipt + rollup for synthesize_concepts. Brain-global
+  // phase — uses 'default' source_id because concepts span sources. Receipt
+  // only fires when concepts were actually written; rollup always fires so
+  // doctor sees the phase ran.
+  if (!opts.dryRun && conceptsWritten > 0) {
+    const runId = `concepts-${Date.now().toString(36)}`;
+    try {
+      await writeReceipt(engine, {
+        kind: 'concepts',
+        source_id: 'default',
+        run_id: runId,
+        round: 'single',
+        extracted_at: new Date().toISOString(),
+        total_rows: conceptsWritten,
+        cost_usd: estimatedSpendUsd,
+        summary:
+          `Synthesized ${conceptsWritten} concepts ` +
+          `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3}) ` +
+          `from ${atomGroups.length} groups across ${atoms.length} atoms.`,
+      });
+    } catch (err) {
+      console.error(`[synthesize_concepts] receipt write failed: ${(err as Error).message}`);
+    }
+  }
+  if (!opts.dryRun) {
+    await upsertExtractRollup(engine, {
+      kind: 'concepts',
+      source_id: 'default',
+      cost_delta: estimatedSpendUsd,
+      round_completed_delta: failures.length === 0 ? 1 : 0,
+      halt_delta: failures.length > 0 ? 1 : 0,
+    });
   }
 
   return {
