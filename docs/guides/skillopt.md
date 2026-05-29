@@ -8,6 +8,12 @@ that measurably improve the score.
 Based on [SkillOpt](https://arxiv.org/abs/2605.23904) (Microsoft Research,
 May 2026).
 
+> **New to this?** Start with the hands-on tutorial:
+> [Auto-improve a skill with `gbrain skillopt`](../tutorials/improving-skills-with-skillopt.md).
+> It walks you from "I have a skill" to "I accepted a measurably better version"
+> in ~20 minutes, including how to write your first benchmark. This page is the
+> reference — flags, exit codes, cost model, safety guards.
+
 ## The 30-second pitch
 
 ```bash
