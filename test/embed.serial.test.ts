@@ -110,6 +110,29 @@ describe('runEmbed --all (parallel)', () => {
     expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(10);
   });
 
+  test('v0.41.30: stamps embedding_signature after embedding each page (--all)', async () => {
+    const pages = [{ slug: 'a', source_id: 'default' }, { slug: 'b', source_id: 'default' }];
+    const chunksBySlug = new Map(
+      pages.map(p => [
+        p.slug,
+        [{ chunk_index: 0, chunk_text: `text ${p.slug}`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 4 }],
+      ]),
+    );
+    const engine = mockEngine({
+      listPages: async () => pages,
+      getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
+      upsertChunks: async () => {},
+    });
+
+    await runEmbed(engine, ['--all']);
+
+    // The wiring gap this pins: embedAll must CALL setPageEmbeddingSignature
+    // after upsertChunks, with the current signature (mocked to test:model:1536).
+    const stampCalls = (engine as any)._calls.filter((c: any) => c.method === 'setPageEmbeddingSignature');
+    expect(stampCalls.length).toBe(2); // one per page
+    expect(stampCalls[0].args[1]).toEqual({ sourceId: 'default', signature: 'test:model:1536' });
+  });
+
   test('respects GBRAIN_EMBED_CONCURRENCY=1 (serial)', async () => {
     const pages = Array.from({ length: 5 }, (_, i) => ({ slug: `page-${i}` }));
     const chunksBySlug = new Map(

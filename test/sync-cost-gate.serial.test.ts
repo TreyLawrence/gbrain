@@ -22,6 +22,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import { CHUNKER_VERSION } from '../src/core/chunkers/code.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 
 let engine: PGLiteEngine;
@@ -126,5 +127,34 @@ describe('v0.41.30 — sync --all cost gate wiring', () => {
 
     expect(exitCode).toBe(2);
     expect(stdout).toContain('"gate":"confirmation_required"');
+  }, 60_000);
+
+  test('R-3: inline, git-unchanged source but STALE chunker_version still estimates (not $0)', async () => {
+    // The unchanged-source short-circuit requires HEAD==last_commit AND clean
+    // tree AND chunker_version == current. Here git is unchanged but the
+    // chunker drifted, so the source must NOT be treated as 0 — sync would
+    // re-chunk + re-embed everything. floor=0 so any nonzero cost blocks.
+    await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
+    await engine.executeRaw(`UPDATE sources SET last_commit = $1, chunker_version = $2 WHERE id = 'vault'`, [headSha, 'STALE-0']);
+    await engine.setConfig('sync.cost_gate_min_usd', '0');
+
+    const { exitCode, stdout } = await runSyncCaptured(['--all', '--serial', '--json', '--no-pull']);
+
+    expect(exitCode).toBe(2);
+    expect(stdout).toContain('"gate":"confirmation_required"');
+  }, 60_000);
+
+  test('R-3 control: inline, git-unchanged + CURRENT chunker_version short-circuits to $0 (no exit 2)', async () => {
+    // Same setup but chunker_version matches current → the source IS unchanged
+    // → contributes 0 new-content tokens → below floor → proceeds (no block).
+    // Proves the short-circuit fires when (and only when) everything matches.
+    await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
+    await engine.executeRaw(`UPDATE sources SET last_commit = $1, chunker_version = $2 WHERE id = 'vault'`, [headSha, String(CHUNKER_VERSION)]);
+    await engine.setConfig('sync.cost_gate_min_usd', '0');
+
+    const { exitCode, stdout } = await runSyncCaptured(['--all', '--serial', '--json', '--no-pull']);
+
+    expect(exitCode).not.toBe(2);
+    expect(stdout).not.toContain('"gate":"confirmation_required"');
   }, 60_000);
 });
