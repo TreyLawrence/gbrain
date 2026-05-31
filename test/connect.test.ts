@@ -255,6 +255,9 @@ describe('buildConnectBlock', () => {
     expect(block).toContain('Token:  TOK');
     expect(block).not.toContain('mcp add');
     expect(block).toContain(LEARN_INSTRUCTION);
+    // surfaces the v0.34 remote-reachability footgun (serve --bind 0.0.0.0)
+    expect(block).toContain('--bind 0.0.0.0');
+    expect(block).toMatch(/docs\/mcp\/PERPLEXITY\.md/);
   });
 });
 

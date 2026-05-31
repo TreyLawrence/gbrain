@@ -1,32 +1,75 @@
 # Connect GBrain to Perplexity Computer
 
-Perplexity Computer supports remote MCP servers with bearer token authentication.
+Perplexity Computer connects as a **remote** MCP client, so GBrain must be served
+over HTTP and reachable at a public HTTPS URL. Perplexity does not run
+`gbrain serve` (stdio) the way Claude Code does — it needs a reachable endpoint:
 
-## Fastest path: `gbrain connect`
+```
+Perplexity Computer
+  → ngrok tunnel (https://YOUR-DOMAIN.ngrok.app/mcp)
+  → gbrain serve --http   (built-in OAuth 2.1 transport)
+  → Postgres / PGLite
+```
 
-Run anywhere `gbrain` is installed to get the exact connector values to paste:
+## 1. Serve GBrain over HTTP (host side)
+
+```bash
+gbrain serve --http --port 3131 --bind 0.0.0.0 \
+  --public-url https://YOUR-DOMAIN.ngrok.app
+```
+
+- **`--bind 0.0.0.0` is required.** Since v0.34, `--http` defaults to
+  `127.0.0.1`, so without it the tunnel reaches the server but the connection is
+  refused (`ECONNREFUSED`).
+- **`--public-url` must match the tunnel.** The OAuth issuer in the discovery
+  metadata has to line up with the URL Perplexity actually hits (RFC 8414 §3.3),
+  or OAuth client-credentials auth fails.
+
+## 2. Expose it with a tunnel
+
+```bash
+ngrok http 3131 --url YOUR-DOMAIN.ngrok.app
+```
+
+See the [ngrok-tunnel recipe](../../recipes/ngrok-tunnel.md) for a persistent
+tunnel.
+
+## 3. Create credentials
+
+Two supported auth paths:
+
+**OAuth 2.1 client credentials (recommended, v0.26.0+):**
+
+```bash
+gbrain auth register-client perplexity --grant-types client_credentials --scopes "read write"
+```
+
+Save the printed `client_id` + `client_secret`.
+
+**Legacy bearer token (simplest):**
 
 ```bash
 gbrain auth create "perplexity"
+```
+
+`gbrain connect` generates the bearer-token paste values for you:
+
+```bash
 gbrain connect https://YOUR-DOMAIN.ngrok.app/mcp --token gbrain_xxx --agent perplexity
 ```
 
-Perplexity is a GUI connector, so there's no `--install` — `gbrain connect` prints
-the URL + token to paste into Settings → Connectors (the manual steps below).
+(Perplexity is a GUI connector, so there's no `--install` — `connect` prints the
+exact URL + token to paste in step 4.)
 
-## Setup
+## 4. Add the connector in Perplexity
 
-1. Open Perplexity (requires Pro subscription)
-2. Go to **Settings > Connectors** (or **MCP Servers**)
+1. Open Perplexity (requires Pro subscription).
+2. Go to **Settings → Connectors** (or **MCP Servers**).
 3. Add a new remote connector:
    - **URL:** `https://YOUR-DOMAIN.ngrok.app/mcp`
-   - **Authentication:** API Key / Bearer Token
-   - **Token:** your GBrain access token
-     (create one with `gbrain auth create "perplexity"`)
-4. Save
-
-Replace `YOUR-DOMAIN` with your ngrok domain (see
-[ngrok-tunnel recipe](../../recipes/ngrok-tunnel.md) for setup).
+   - **Authentication:** API Key / Bearer Token, or OAuth client credentials
+   - Paste the token (bearer) or `client_id` + `client_secret` (OAuth).
+4. Save.
 
 ## Verify
 
@@ -36,8 +79,14 @@ In a Perplexity conversation, ask it to use your brain:
 Use my GBrain to search for [topic]
 ```
 
+Have it call `get_brain_identity` (whose brain this is), then `list_skills`
+(everything it can do).
+
 ## Notes
 
-- Perplexity Computer is available to Pro subscribers
-- Both the Perplexity Mac app and web version support MCP connectors
-- The Mac app also supports local MCP servers if you prefer `gbrain serve` (stdio)
+- Perplexity Computer is available to Pro subscribers; both the Mac app and web
+  version support remote MCP connectors.
+- The Mac app can also use a local MCP server (`gbrain serve` stdio) if you'd
+  rather not expose an HTTP endpoint.
+- A `gbrain auth create` token is a long-lived, full-access secret. Keep it
+  private and prefer a scoped token where possible.
