@@ -35,7 +35,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'skillopt']);
+const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -75,6 +75,9 @@ const CLI_ONLY_SELF_HELP = new Set([
   // describing segment splitting + checkpointing + budget caps + the
   // unified types config story. Route around the generic short-circuit.
   'extract-conversation-facts',
+  // `gbrain connect --help` prints its own usage (flags + examples) from
+  // runConnect; route around the generic one-line short-circuit.
+  'connect',
 ]);
 
 async function main() {
@@ -904,6 +907,14 @@ async function handleCliOnly(command: string, args: string[]) {
     // `runRemote` self-checks for remote_mcp config and exits 1 if local-only.
     const { runRemote } = await import('./commands/remote.ts');
     await runRemote(args);
+    return;
+  }
+  if (command === 'connect') {
+    // No local DB: connect generates/wires a Claude Code MCP connection to a
+    // REMOTE gbrain over HTTP from a bearer token. Print mode touches nothing;
+    // --install talks to the remote, not the local engine.
+    const { runConnect } = await import('./commands/connect.ts');
+    await runConnect(args);
     return;
   }
   if (command === 'upgrade') {
@@ -2071,6 +2082,8 @@ ADMIN
     --token-ttl N                    Access token TTL in seconds (default: 3600)
     --enable-dcr                     Enable Dynamic Client Registration
     --public-url URL                 Public issuer URL (required behind proxy/tunnel)
+  connect <mcp-url> --token <t>      Wire Claude Code to a remote gbrain (bearer token)
+        [--install] [--json]         Print the paste-ready command, or --install to run it
   call <tool> '<json>'               Raw tool invocation
   version                            Version info
   --tools-json                       Tool discovery (JSON)
