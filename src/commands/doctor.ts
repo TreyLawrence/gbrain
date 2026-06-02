@@ -5301,6 +5301,50 @@ export async function buildChecks(
     });
   }
 
+  // v0.42 (#1699) content-quality gate: quarantined (hidden junk) +
+  // flagged (warned, still searchable) page counts. Both are simple
+  // JSONB key-existence scans (cheap; the marked subset stays small).
+  progress.heartbeat('quarantined_pages');
+  try {
+    // engine.executeRaw (NOT db.getConnection() — that's the postgres singleton,
+    // dead on the default PGLite engine). The JSONB `?` existence operator is
+    // literal SQL through executeRaw on both engines.
+    const rows = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*)::int AS n FROM pages p WHERE p.deleted_at IS NULL AND p.frontmatter ? 'quarantine'`,
+    );
+    const n = Number(rows[0]?.n ?? 0);
+    checks.push({
+      name: 'quarantined_pages',
+      status: n > 0 ? 'warn' : 'ok',
+      message: n > 0
+        ? `${n} page(s) quarantined as junk (hidden from search). Review with 'gbrain quarantine list'; clear a false positive with 'gbrain quarantine clear <slug>'.`
+        : 'No quarantined pages',
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    checks.push({ name: 'quarantined_pages', status: 'ok', message: `Skipped (${msg})` });
+  }
+
+  progress.heartbeat('flagged_pages');
+  try {
+    const rows = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*)::int AS n FROM pages p WHERE p.deleted_at IS NULL AND p.frontmatter ? 'content_flag'`,
+    );
+    const n = Number(rows[0]?.n ?? 0);
+    // Flagged pages are "examine me", not "broken" — warn so they're visible
+    // but the message is non-alarming.
+    checks.push({
+      name: 'flagged_pages',
+      status: n > 0 ? 'warn' : 'ok',
+      message: n > 0
+        ? `${n} page(s) flagged (markup-heavy or oversize) — still searchable, agent warned on retrieval. Review with 'gbrain quarantine list --include-flagged'.`
+        : 'No flagged pages',
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    checks.push({ name: 'flagged_pages', status: 'ok', message: `Skipped (${msg})` });
+  }
+
   // 11a. Frontmatter integrity (v0.22.4, hardened in v0.38.2.0).
   // scanBrainSources walks every registered source's local_path on disk
   // (not from the DB), invoking parseMarkdown(..., {validate:true}) per

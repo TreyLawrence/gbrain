@@ -2905,6 +2905,28 @@ export class PGLiteEngine implements BrainEngine {
     return result;
   }
 
+  async getContentFlagsByPageIds(
+    pageIds: number[],
+  ): Promise<Map<number, { reason: string; detail: string }>> {
+    const result = new Map<number, { reason: string; detail: string }>();
+    if (pageIds.length === 0) return result;
+    // Parity with PostgresEngine.getContentFlagsByPageIds (issue #1699).
+    const { rows } = await this.db.query(
+      `SELECT id,
+              frontmatter -> 'content_flag' ->> 'reason' AS reason,
+              frontmatter -> 'content_flag' ->> 'detail' AS detail
+       FROM pages
+       WHERE id = ANY($1::int[])
+         AND frontmatter ? 'content_flag'`,
+      [pageIds]
+    );
+    for (const r of rows as { id: number; reason: string | null; detail: string | null }[]) {
+      if (!r.reason) continue;
+      result.set(Number(r.id), { reason: r.reason, detail: r.detail ?? '' });
+    }
+    return result;
+  }
+
   async getPageTimestamps(slugs: string[]): Promise<Map<string, Date>> {
     if (slugs.length === 0) return new Map();
     const { rows } = await this.db.query(

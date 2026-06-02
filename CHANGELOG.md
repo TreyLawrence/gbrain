@@ -2,6 +2,76 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.8.0] - 2026-06-01
+
+**Scraped junk stops landing in your brain as if it were real content, and when something looks off, your agent gets told instead of being left to guess.**
+
+Two junk pages had been landing via `gbrain sync`: a Cloudflare "checking your browser" screen ingested as if it were the article, and an 890K-char wall of mostly-boilerplate that got chunked and embedded at full cost. Both had to be hand-deleted. This release adds a content-quality gate at the one place every ingest path flows through, with a deliberately simple rule: hide only the unambiguous crap; for anything fuzzy, keep it usable and warn the agent.
+
+Three tiers, by how confident the gate is:
+
+| What it sees | What happens | Still searchable? |
+|---|---|---|
+| A known junk shape (Cloudflare / CAPTCHA / "checking your browser") | **quarantined** — lands hidden, reviewable | no (and writes zero chunks) |
+| Looks boilerplate-ish (mostly markup, little prose) | **flagged** — stays put, agent warned | yes, with a `content_flag` note |
+| Unusually large | not embedded (existing behavior), agent warned | by title via `get_page` |
+
+The flag is the important part. A page that's *probably* junk but might be a legit reference table or API doc never disappears. It stays searchable, and when your agent retrieves it, the result carries a `content_flag` ("this looks like boilerplate, examine if you expected real content"). Your agent decides. Books and long prose are unaffected (they're prose, not markup, so the boilerplate check never fires on them).
+
+**How to use it.** It's on by default. Nothing to configure. To see what got caught:
+
+```bash
+gbrain quarantine list                     # hidden junk
+gbrain quarantine list --include-flagged   # + the "examine me" pages
+gbrain quarantine scan --apply             # retroactively catch junk that predates the gate
+gbrain quarantine clear <slug>             # release a false positive
+```
+
+`gbrain doctor` gains `quarantined_pages` and `flagged_pages` checks so you see the counts at a glance.
+
+**Tuning (optional).**
+
+```bash
+gbrain config set content_sanity.junk_disposition reject    # hard-reject junk instead of quarantining
+gbrain config set content_sanity.prose_check_enabled false  # turn off the fuzzy markup flag entirely
+gbrain config set content_sanity.max_markup_ratio 0.9       # how markup-heavy before flagging (default 0.85)
+```
+
+**What's safe to know about.** Quarantine and flag are frontmatter markers, no schema migration. Quarantined pages stay reviewable via `gbrain get` and re-surface the moment you fix the source and re-sync. The markup heuristic is a flag, never a hide, so a false positive costs your agent a one-line note, not a vanished page.
+
+**What we caught before shipping.** Two independent review passes found bugs the first didn't. A remote agent with write access could have planted a `quarantine` marker on clean content to silently hide a page, or smuggled text into the agent-warning channel; both are now stripped at the trust boundary so only the gate sets those markers. And the gate's timestamp was leaking into the change-detection hash, which would have made every flagged page re-embed on every sync forever; the marker is now excluded from the hash, so a flagged page re-syncs as unchanged.
+
+### To take advantage of v0.42.6.0
+
+`gbrain upgrade` handles this automatically (no schema migration). The gate is on by default for every new sync. To sweep junk that's already in your brain from before this release:
+
+```bash
+gbrain quarantine scan            # dry-run: see what would be caught
+gbrain quarantine scan --apply    # mark it
+gbrain doctor                     # confirm quarantined_pages / flagged_pages counts
+```
+
+If a legitimate page got caught, `gbrain quarantine clear <slug>` releases it. If anything looks wrong, file an issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output.
+
+### Itemized changes
+
+#### Added
+- **Content-quality gate** (`src/core/content-sanity.ts`): three new interstitial junk patterns (`cloudflare_checking_browser`, `cf_browser_verification`, `enable_javascript_cookies`) plus a prose-vs-markup heuristic (`assessProse`) that flags boilerplate-shaped pages. The pass runs only in the warn-tier byte window, excludes code from the ratio, and exempts `page_kind: code` pages.
+- **`src/core/quarantine.ts`** (new): two frontmatter markers, `quarantine` (hides from search) and `content_flag` (warns, stays searchable), siblings of the existing `embed_skip` marker.
+- **`gbrain quarantine` CLI** (`list` / `clear` / `scan`) for reviewing, releasing, and retroactively applying the gate.
+- **Agent-warning channel**: `SearchResult.content_flag` (stamped post-fusion in `hybridSearch`, including the keyword-only `search` op path) and a top-level `content_flag` on the `get_page` op, so an agent sees the warning whether it searches or fetches a page directly.
+- **Doctor checks** `quarantined_pages` + `flagged_pages` (run on both Postgres and PGLite).
+- Config keys `content_sanity.junk_disposition` (quarantine|reject), `max_markup_ratio`, `prose_check_enabled` (file/env/DB planes; `GBRAIN_MAX_MARKUP_RATIO` env).
+
+#### Changed
+- The ingest narrow waist (`importFromContent`) now routes junk to quarantine (default) or reject, markup-heavy to flag, oversize to soft-block + flag. `buildVisibilityClause` excludes quarantined pages from all six search call sites (flagged pages stay visible).
+- `gbrain sources audit` is disposition-aware (reports would-quarantine vs would-reject, plus a would-flag bucket); `gbrain lint` gains a `markup-heavy` rule.
+- New `BrainEngine.getContentFlagsByPageIds` (both engines) backs the search-result warning stamp.
+
+#### Fixed
+- Gate-owned markers (`quarantine` / `content_flag` / `embed_skip`) are stripped from incoming frontmatter for untrusted (remote MCP) callers, so a write-scoped client can't hide a page or inject text into the agent-warning channel.
+- Gate marker timestamps are excluded from the page content hash, so flagged/quarantined pages no longer look "changed" on every re-sync (which would have forced endless re-chunk/re-embed).
+
 ## [0.42.7.0] - 2026-06-01
 
 **Your brain now tells you when it has imported pages but never connected them — and gives you a one-command fix.**

@@ -2979,6 +2979,27 @@ export class PostgresEngine implements BrainEngine {
     return result;
   }
 
+  async getContentFlagsByPageIds(
+    pageIds: number[],
+  ): Promise<Map<number, { reason: string; detail: string }>> {
+    const result = new Map<number, { reason: string; detail: string }>();
+    if (pageIds.length === 0) return result;
+    const sql = this.sql;
+    const rows = await sql`
+      SELECT id,
+             frontmatter -> 'content_flag' ->> 'reason' AS reason,
+             frontmatter -> 'content_flag' ->> 'detail' AS detail
+      FROM pages
+      WHERE id = ANY(${pageIds}::int[])
+        AND frontmatter ? 'content_flag'
+    `;
+    for (const r of rows as unknown as { id: number; reason: string | null; detail: string | null }[]) {
+      if (!r.reason) continue;
+      result.set(Number(r.id), { reason: r.reason, detail: r.detail ?? '' });
+    }
+    return result;
+  }
+
   async getPageTimestamps(slugs: string[]): Promise<Map<string, Date>> {
     if (slugs.length === 0) return new Map();
     const sql = this.sql;

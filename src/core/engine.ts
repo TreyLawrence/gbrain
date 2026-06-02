@@ -1213,6 +1213,17 @@ export interface BrainEngine {
    */
   getAdjacencyBoosts(pageIds: number[]): Promise<Map<number, AdjacencyRow>>;
   /**
+   * v0.42 (issue #1699): for a list of page_ids, return their
+   * `frontmatter.content_flag` markers (reason + detail). Used by hybrid
+   * search to stamp `SearchResult.content_flag` post-fusion — the
+   * agent-warning channel for fuzzy markup-heavy / oversize pages that
+   * stay searchable. Single SQL query, not N+1. Pages without the marker
+   * get no entry in the map. Empty input → empty map (no query).
+   */
+  getContentFlagsByPageIds(
+    pageIds: number[],
+  ): Promise<Map<number, { reason: string; detail: string }>>;
+  /**
    * v0.27.0: for a list of slugs, return their updated_at timestamps (or created_at fallback).
    * Used by hybrid search recency boost. Single SQL query, not N+1.
    * Slugs with no timestamp get no entry in the map.

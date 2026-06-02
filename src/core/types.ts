@@ -662,6 +662,16 @@ export interface SearchResult {
   score: number;
   stale: boolean;
   /**
+   * v0.42 (issue #1699) content-quality gate agent-warning channel. Set
+   * when the result's page carries a `frontmatter.content_flag` marker
+   * (fuzzy markup-heavy or oversize). The page is still searchable — this
+   * is the "this looks odd, examine if you expected real content" signal
+   * the agent reads to decide whether to trust the page. Stamped post-
+   * fusion by `stampContentFlags` (the v0.41.34 stampEvidence precedent).
+   * Absent when the page is clean.
+   */
+  content_flag?: { reason: string; detail: string };
+  /**
    * v0.36 (cross-modal wave): the chunk's modality discriminator from
    * content_chunks.modality. 'text' for the existing text-embedding rows,
    * 'image' for rows populated by importImageFile. Surfaced so callers /
