@@ -179,11 +179,17 @@ describe('pruneOldBatchRetryAuditFiles — codex H-8 actual pruning', () => {
     });
   });
 
-  test('no-op when audit dir does not exist (ENOENT)', () => {
-    const result = pruneOldBatchRetryAuditFiles(30, new Date());
-    // Even without the env override, the function never throws on missing dir.
-    // We just check it returns the empty result without throwing.
-    expect(result).toEqual({ removed: 0, kept: 0 });
+  test('no-op when audit dir does not exist (ENOENT)', async () => {
+    // Point GBRAIN_AUDIT_DIR at a guaranteed-missing subdir of the per-test
+    // tmpDir. Without this override the function reads the real ~/.gbrain/audit,
+    // so the assertion flakes on any dev machine that already has a real
+    // batch-retry-*.jsonl on disk (returns kept:1, not kept:0). Hermetic now,
+    // matching this file's header contract.
+    await withEnv({ GBRAIN_AUDIT_DIR: path.join(tmpDir, 'does-not-exist') }, async () => {
+      const result = pruneOldBatchRetryAuditFiles(30, new Date());
+      // The function never throws on a missing dir; it returns the empty result.
+      expect(result).toEqual({ removed: 0, kept: 0 });
+    });
   });
 });
 
