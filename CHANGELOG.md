@@ -2,6 +2,69 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.22.0] - 2026-06-03
+
+**A background worker whose database connection quietly dies no longer sits there alive-but-doing-nothing for hours. Your brain keeps processing jobs instead of silently stalling overnight.**
+
+Here's the failure this fixes. You run the job supervisor (`gbrain jobs supervisor`), which babysits a worker process that chews through your queue: syncs, embeds, the nightly cycle. Behind a connection pooler (the common Supabase setup), the worker's database connection can get dropped and never come back. The worker process stays *running* the whole time. It just can't talk to the database anymore, so it claims no jobs and finishes nothing. Jobs pile up. Nothing crashes, nothing alerts. One brain sat like this for about 15 hours: 57 jobs waiting, zero being worked, the supervisor logging the same "no recent completions" line once a minute and doing nothing about it. The only fix was noticing by hand and killing the whole process tree so a fresh one could start with a working connection.
+
+The reason every safety net missed it: they all check whether the process is *alive*, and it was. A worker that's running but wedged passes every liveness check, every `ps`, every container health probe. What nobody was checking was whether it's making *forward progress*.
+
+This release adds that check, in two independent layers so one covers the other:
+
+- **The worker now notices its own dead connection.** It already had a "can I reach the database?" heartbeat, but that heartbeat was switched off whenever a supervisor was watching (on the theory the supervisor had it covered). It didn't. Now the heartbeat runs under supervision too: a worker whose pool is dead exits on its own within about three minutes, and the supervisor restarts it with a fresh connection.
+- **The supervisor now watches forward progress, not just liveness.** If a queue has work the worker can handle, nothing is actively being worked, and nothing has completed for 15 minutes while the worker claims to be alive, the supervisor treats the worker as wedged and restarts it. This catches every cause of a stall, not just dead connections (a genuinely stuck job handler, a deadlock, anything).
+
+And the stall is now loud instead of buried. `gbrain jobs stats` prints a `WEDGED QUEUE` line, and `gbrain doctor` reports a `wedged_queue` health error with the fix command, so you catch it in the daily check instead of 15 hours later.
+
+### How to use it
+
+Nothing to configure. `gbrain upgrade`, restart your supervisor, done. The watchdog is on by default with conservative thresholds. If you want to tune it:
+
+```
+# minutes of no-forward-progress before the supervisor restarts a wedged worker (default 15; 0 disables)
+gbrain jobs supervisor --wedge-restart-minutes 15
+# consecutive checks that must agree before acting (default 3)
+gbrain jobs supervisor --wedge-restart-checks 3
+```
+
+### What you'd see
+
+| | Before | After |
+|---|---|---|
+| Worker pool dies, process stays up | sits idle forever (15h observed) | self-exits in ~3 min, supervisor respawns with a fresh pool |
+| A job handler genuinely hangs | invisible to the supervisor | restarted after 15 min of no progress |
+| You check `gbrain jobs stats` | "57 waiting, 0 active" with no flag | loud `WEDGED QUEUE` line + fix command |
+| `gbrain doctor` | silent (the remote check was even querying the wrong column) | `wedged_queue` health error, grouped per queue |
+
+### What we caught before shipping
+
+An independent review of the plan found real bugs in the first draft that would have let the fix itself fail in the same way it was meant to prevent:
+
+- The supervisor's existing "force kill" path was a silent no-op. It guarded on "did we already send a signal" instead of "is the process still alive," so the follow-up `SIGKILL` after an ignored `SIGTERM` never actually fired. That bug was already present in the existing shutdown path; it's fixed here too.
+- A worker that died mid-job leaves a stale "active" row behind. The first draft would have read that stale row as "something's being worked" and suppressed the restart forever. The watchdog now only counts jobs holding a live lock.
+- The restart is now accounted as a deliberate self-heal, so a recurring wedge can't slowly burn through the crash budget and take the whole supervisor down. After a few futile restarts in a window it stops restarting and just alerts, because at that point a restart clearly isn't the fix.
+
+This release coexists with the v0.42.16.0 doctor self-heal work (OOM-loop detection, pool-reap health); the two cover different failure modes and run side by side.
+
+## To take advantage of v0.42.22.0
+
+`gbrain upgrade`, then restart your job supervisor so the new watchdog is in effect:
+
+```
+gbrain jobs supervisor stop && gbrain jobs supervisor start
+```
+
+Verify: `gbrain doctor` should show a `wedged_queue` check (it reads `ok` on a healthy queue). If you ever see it go to a health error, the fix is the same stop/start above, plus `gbrain jobs retry <id>` on any dead-lettered jobs.
+
+### For contributors
+- `child-worker-supervisor.ts`: `killChild` now gates on `exitCode/signalCode === null` (liveness) instead of `.killed` (the v0.42.16-era no-op bug, also fixing the `shutdown()` drain); new `restartCurrentChild(graceMs)` captures the child ref and SIGTERM→grace→SIGKILLs *that* ref (never the respawn); a new `wedge_restart` cause flows through the exit classifier and `supervisor-audit.ts` `CLEAN_EXIT_CAUSES` so it's not counted as a crash.
+- `supervisor.ts`: progress watchdog in `healthCheck()` + new exported `queryWedgeSignals(engine, queue, handlerNames)` (name+queue-scoped, `active_healthy` = live-lock only, due-delayed counted); runtime handler-name derivation via a throwaway `registerBuiltinHandlers` worker (new `quiet` opt) so the wedge scopes to actually-claimable names with zero duplicated constant; startup-grace + `wedgeRestartLoopBudget` knobs.
+- `worker.ts`: DB-liveness probe un-gated under `GBRAIN_SUPERVISED`; stall detection stays supervised-off.
+- `doctor.ts`: standalone per-queue `wedged_queue` check (local + remote) + `state`→`status` fix on the remote `queue_health` SQL (it errored every run and silently returned "No queue activity").
+- `queue.ts`/`jobs.ts`: queue-scoped `getStats` wedge block + `jobs stats` WEDGED line.
+- Tests: `supervisor-wedge`, `worker-supervised-db-probe`, `doctor-wedged-queue`, `queue-getstats-wedge`, plus `child-worker-supervisor` additions (behavioral restart coverage + PGLite SQL semantics for every reviewed edge case + structural regression guards). Plan went through eng review + a Codex outside-voice pass; all 16 findings folded in.
+
 ## [0.42.21.0] - 2026-06-02
 
 **Your nightly `gbrain dream` stops silently losing every database phase.** If you run gbrain on Postgres (local or Supabase), the dream cycle has been quietly failing: the `lint` and `backlinks` phases work, then `sync`, `synthesize`, `embed`, and the rest all blow up with `No database connection: connect() has not been called`. The extract phase reports "created 0 links" while actually dropping every row. Run the same phases one at a time in separate commands and they all work — only the full cycle breaks. The result: your brain quietly stops staying up to date, and the cycle leaves a stuck lock behind.

@@ -642,9 +642,12 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // shape; skip the check there with an informational message.
   if (engine.kind === 'postgres') {
     try {
+      // issue #1801: column is `status`, not `state` (schema.sql:780). The
+      // pre-fix query errored every run and the catch silently returned "No
+      // queue activity," so this remote/thin-client check was a no-op.
       const rows = await engine.executeRaw<{ stalled: string | number }>(
         `SELECT COUNT(*) AS stalled FROM minion_jobs
-          WHERE state = 'active'
+          WHERE status = 'active'
             AND started_at IS NOT NULL
             AND started_at < NOW() - INTERVAL '1 hour'`,
       );
@@ -662,6 +665,9 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   } else {
     checks.push({ name: 'queue_health', status: 'ok', message: 'PGLite — no queue to check' });
   }
+
+  // issue #1801 — wedged_queue (cross-surface parity with buildChecks).
+  checks.push(await computeWedgedQueueCheck(engine));
 
   // v0.41 Bug 2 / Eng D8 — subagent_health surfaces rate-lease pressure to the operator.
   checks.push(await checkSubagentHealth(engine));
@@ -1459,6 +1465,78 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
  * Also surfaces (codex M-10): runs resolveBulkRetryOpts(process.env) at
  * startup so bad GBRAIN_BULK_* config fails at doctor time, not first-retry.
  */
+/**
+ * issue #1801 — `wedged_queue` check. Surfaces the alive-but-wedged-worker
+ * signature (a queue with claimable work waiting, zero live-lock active jobs,
+ * and stale completions) as a health ERROR, so an operator / the daily doctor
+ * catches a silent processing halt in minutes, not 15 hours.
+ *
+ * Postgres-only (PGLite has no multi-process worker surface). Grouped BY queue
+ * (Codex #15) so a healthy worker on one queue can't mask a wedged one.
+ * `active_healthy` counts only live-lock active rows, so an expired-lock active
+ * row (a worker that died mid-job) does NOT mask the wedge (Codex #6). The
+ * check is conservative for the advisory surface: it fails only on stale-after-
+ * progress (mins_since_completion > threshold, non-null); a queue that never
+ * completed anything is left to the supervisor's startup-grace-aware watchdog
+ * to avoid crying wolf on a freshly-submitted queue with no worker yet.
+ *
+ * Exported so `test/doctor.test.ts` drives it directly. Reads
+ * GBRAIN_WEDGED_QUEUE_WARN_MINUTES (default 15).
+ */
+export async function computeWedgedQueueCheck(engine: BrainEngine): Promise<Check> {
+  if (engine.kind !== 'postgres') {
+    return { name: 'wedged_queue', status: 'ok', message: 'PGLite — no queue to check' };
+  }
+  const thresholdMin = _resolveEnvNumber('GBRAIN_WEDGED_QUEUE_WARN_MINUTES', 15);
+  try {
+    const rows = await engine.executeRaw<{
+      queue: string;
+      active_healthy: string | number;
+      waiting: string | number;
+      mins_since_completion: string | number | null;
+    }>(
+      `SELECT queue,
+         count(*) FILTER (WHERE status = 'active' AND lock_until > now()) AS active_healthy,
+         count(*) FILTER (WHERE status = 'waiting') AS waiting,
+         EXTRACT(EPOCH FROM (now() - max(updated_at) FILTER (WHERE status = 'completed'))) / 60
+           AS mins_since_completion
+       FROM minion_jobs
+       GROUP BY queue`,
+    );
+    const wedged: string[] = [];
+    for (const r of rows) {
+      const activeHealthy = Number(r.active_healthy ?? 0);
+      const waiting = Number(r.waiting ?? 0);
+      const mins = r.mins_since_completion === null ? null : Number(r.mins_since_completion);
+      // Conservative: only flag stale-after-progress (non-null mins past
+      // threshold). The null-completions case is the supervisor's job.
+      if (activeHealthy === 0 && waiting > 0 && mins !== null && mins > thresholdMin) {
+        wedged.push(`'${r.queue}' (${waiting} waiting, 0 active, ${Math.round(mins)}m since last completion)`);
+      }
+    }
+    if (wedged.length === 0) {
+      return { name: 'wedged_queue', status: 'ok', message: 'No wedged queues' };
+    }
+    return {
+      name: 'wedged_queue',
+      status: 'fail',
+      message:
+        `Wedged queue(s) — worker alive but not claiming work: ${wedged.join('; ')}. ` +
+        `Restart the worker so it rebuilds a fresh DB pool: ` +
+        `\`gbrain jobs supervisor stop && gbrain jobs supervisor start\`, ` +
+        `then \`gbrain jobs retry <id>\` on any dead-lettered jobs.`,
+      details: { wedged_queues: wedged.length, threshold_minutes: thresholdMin },
+    };
+  } catch (e) {
+    // Pre-migration brains / transient errors: advisory check stays ok.
+    return {
+      name: 'wedged_queue',
+      status: 'ok',
+      message: `Skipped (${e instanceof Error ? e.message : String(e)})`,
+    };
+  }
+}
+
 export async function checkBatchRetryHealth(_engine: BrainEngine): Promise<Check> {
   try {
     // Codex M-10: surface bad env config at doctor time.
@@ -6709,6 +6787,10 @@ export async function buildChecks(
     // surfacing via the batch-retry audit JSONL. Codex H-9 thresholds.
     progress.heartbeat('batch_retry_health');
     checks.push(await checkBatchRetryHealth(engine));
+    // issue #1801 wedged_queue — alive-but-wedged worker (claimable work
+    // waiting, zero live-lock active, stale completions) as a health error.
+    progress.heartbeat('wedged_queue');
+    checks.push(await computeWedgedQueueCheck(engine));
     // v0.40.4 graph_signals_coverage — global inbound-link density when
     // graph_signals is enabled in the active mode bundle.
     progress.heartbeat('graph_signals_coverage');

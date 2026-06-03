@@ -151,6 +151,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'subagent_health',
   'supervisor',
   'sync_consolidation',
+  'wedged_queue',
   'worker_oom_loop',
   'ze_embedding_health',
 ]);

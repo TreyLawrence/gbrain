@@ -533,7 +533,8 @@ HANDLER TYPES (built in)
       try { await queue.ensureSchema(); }
       catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
-      const stats = await queue.getStats();
+      const statsQueue = parseFlag(args, '--queue') ?? 'default';
+      const stats = await queue.getStats({ queue: statsQueue });
 
       console.log('Job Stats (last 24h):');
       if (stats.by_type.length > 0) {
@@ -546,6 +547,31 @@ HANDLER TYPES (built in)
         console.log('  No jobs in the last 24 hours.');
       }
       console.log(`\n  Queue health: ${stats.queue_health.waiting} waiting, ${stats.queue_health.active} active, ${stats.queue_health.stalled} stalled`);
+
+      // issue #1801 — wedged-queue signature (queue-scoped): a worker is alive
+      // but claiming nothing while work waits. `active_healthy` (live-lock only)
+      // means an expired-lock active row doesn't mask it. Loud line so the
+      // operator/agent catches a silent halt in `jobs stats`, not 15h later.
+      {
+        const w = stats.wedge;
+        const mins = w.minutes_since_completion;
+        // Same threshold the doctor `wedged_queue` check uses, so the two
+        // advisory surfaces agree (issue #1801).
+        const wedgeMins = (() => {
+          const raw = parseInt(process.env.GBRAIN_WEDGED_QUEUE_WARN_MINUTES ?? '', 10);
+          return Number.isFinite(raw) && raw > 0 ? raw : 15;
+        })();
+        const wedged = w.active_healthy === 0 && w.waiting > 0 && (mins === null || mins > wedgeMins);
+        if (wedged) {
+          const since = mins === null ? 'no completions on record' : `${mins}m since last completion`;
+          console.log(
+            `\n  ⚠  WEDGED QUEUE '${w.queue}': ${w.waiting} waiting, 0 active (live-lock), ${since}.\n` +
+            `     A worker may be alive but stuck (dead DB pool / stuck handler). Fix:\n` +
+            `       gbrain jobs supervisor stop && gbrain jobs supervisor start   # rebuild a fresh pool\n` +
+            `       gbrain jobs retry <id>                                        # for dead-lettered jobs`,
+          );
+        }
+      }
 
       // v0.41 Bug 2 / Eng D8 — surface lease pressure to the operator.
       // Reads minion_lease_pressure_log windowed at 1h. Best-effort: pre-v93
@@ -849,8 +875,12 @@ HANDLER TYPES (built in)
           watchdogNote = `, watchdog: ${maxRssMb}MB (auto-sized from ${Math.round(d.basisMb / 1024)}GB ${d.source} RAM)`;
         }
       }
-      const healthNote = !isSupervisedChild && healthCheckInterval > 0
-        ? `, health-check: ${Math.round(healthCheckInterval / 1000)}s`
+      // issue #1801 (fix #2): the DB-liveness probe runs under supervision too;
+      // only stall detection is supervised-off. Report accordingly.
+      const healthNote = healthCheckInterval > 0
+        ? (isSupervisedChild
+            ? `, db-probe: ${Math.round(healthCheckInterval / 1000)}s`
+            : `, health-check: ${Math.round(healthCheckInterval / 1000)}s`)
         : '';
       console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}${watchdogNote}${healthNote})`);
       console.log(`Registered handlers: ${worker.registeredNames.join(', ')}`);
@@ -1130,7 +1160,17 @@ HANDLER TYPES (built in)
  *
  * Per the v0.11.1 plan (Codex architecture #5 — tension 3).
  */
-export async function registerBuiltinHandlers(worker: MinionWorker, engine: BrainEngine): Promise<void> {
+export async function registerBuiltinHandlers(
+  worker: MinionWorker,
+  engine: BrainEngine,
+  opts?: { quiet?: boolean },
+): Promise<void> {
+  // `quiet` suppresses the informational startup stderr lines. The supervisor
+  // (issue #1801) runs this against a throwaway worker purely to read
+  // `registeredNames` for wedge name-scoping — it must not spam the operator's
+  // terminal with "shell handler registered…" lines. The real `jobs work` path
+  // omits opts and prints as before.
+  const quiet = opts?.quiet === true;
   worker.register('sync', async (job) => {
     const { performSync } = await import('./sync.ts');
     const repoPath = typeof job.data.repoPath === 'string' ? job.data.repoPath : undefined;
@@ -1512,10 +1552,12 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
   {
     const { shellHandler } = await import('../core/minions/handlers/shell.ts');
     worker.register('shell', shellHandler);
-    if (process.env.GBRAIN_ALLOW_SHELL_JOBS === '1') {
-      process.stderr.write('[minion worker] shell handler enabled (GBRAIN_ALLOW_SHELL_JOBS=1)\n');
-    } else {
-      process.stderr.write('[minion worker] shell handler registered in guarded mode (set GBRAIN_ALLOW_SHELL_JOBS=1 to execute shell jobs)\n');
+    if (!quiet) {
+      if (process.env.GBRAIN_ALLOW_SHELL_JOBS === '1') {
+        process.stderr.write('[minion worker] shell handler enabled (GBRAIN_ALLOW_SHELL_JOBS=1)\n');
+      } else {
+        process.stderr.write('[minion worker] shell handler registered in guarded mode (set GBRAIN_ALLOW_SHELL_JOBS=1 to execute shell jobs)\n');
+      }
     }
   }
 
