@@ -95,6 +95,27 @@ structural change). Plan + GSTACK REVIEW REPORT at
   (`apply-edits.ts:311`) + `mkdirSync(recursive)` in
   `runOptimizationLoop` (`src/core/skillopt/orchestrator.ts`). Small, own PR.
 
+## Minion-lock direct-pool follow-up (v0.42+)
+
+Filed from the eng-review of the lock-claim/renewLock → direct-session-pool fix
+(PR #1816, now folded into `garrytan/minion-locks-session-pool`). Deliberately
+scoped OUT of that change; not a regression.
+
+- [ ] **P3 — Size the direct session pool for enrich fan-out.** The lock
+  hot-path (`claim`/`renewLock`) now routes through the direct session-mode pool
+  (port 5432) via `executeRawDirect`. Supabase's session-mode pool has a far
+  smaller connection ceiling than the transaction pooler (6543). `executeRawDirect`
+  checks out per-statement (not held open), so the risk is bounded by *concurrent
+  in-flight heartbeats*, not duration — but under heavy `enrich` fan-out (many
+  Minion workers each heartbeating at once) the smaller pool could contend or
+  exhaust. **Why:** a starved session pool would reintroduce the exact wedge class
+  the fix removes, just from a different cause. **Current state:** direct pool size
+  comes from `resolveDirectPoolSize` / `DEFAULT_DIRECT_POOL_SIZE`
+  (`src/core/connection-manager.ts`); no fan-out-aware tuning. **Where to start:**
+  measure concurrent heartbeat count under a realistic `enrich` burst, compare to
+  `DEFAULT_DIRECT_POOL_SIZE`, and either raise the default or add a
+  worker-count-aware knob. **Depends on:** PR #1816 landing first.
+
 ## v0.42.12.0 #1685 brain-health-as-solved follow-ups (v0.42+)
 
 Deferred from the v0.42.12.0 wave (issue #1685, the posture umbrella over #1678/#1735).
