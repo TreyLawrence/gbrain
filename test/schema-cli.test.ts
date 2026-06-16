@@ -63,6 +63,10 @@ describe('gbrain schema CLI (Phase C)', () => {
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('Bundled packs:');
     expect(r.stdout).toContain('gbrain-base');
+    // Bundled enumeration must include every YAML in src/core/schema-pack/base/,
+    // not a hardcoded subset (regression guard for the pre-fix bug where only
+    // gbrain-base and gbrain-recommended were listed).
+    expect(r.stdout).toContain('gbrain-base-v2');
   });
 
   test('schema show gbrain-base prints manifest details', () => {
