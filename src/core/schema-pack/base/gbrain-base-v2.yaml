@@ -302,6 +302,19 @@ page_types:
     extractable: true
     expert_routing: false
 
+  - name: paper
+    primitive: media
+    path_prefixes:
+      - papers/
+    aliases:
+      - arxiv
+      - preprint
+      - publication
+      - research-paper
+      - academic-paper
+    extractable: true
+    expert_routing: false
+
 link_types:
   - name: partner_of
     inverse: partner_of
